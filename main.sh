@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# VOLTRON TECH TUNNEL v5.0 (NET2SHARE + FALCON STYLE)
+# VOLTRON TECH TUNNEL v6.0 (NET2SHARE + FALCON STYLE)
 # Description: DNSTT • SLIPSTREAM • VAYDNS • NOIZDNS • SSH • SOCKS5
 # Features: Multi-Tunnel, Port 53 only, deSEC Auto Domain, Speed Boosters
 #           Auto SSH Banner (Falcon Style), User Managers, Client Config
@@ -33,6 +33,8 @@ C_ACCENT=$C_CYAN
 # ========== DIRECTORY STRUCTURE ==========
 DB_DIR="/etc/voltrontech"
 DNSTT_KEYS_DIR="$DB_DIR/dnstt"
+VAYDNS_KEYS_DIR="$DB_DIR/vaydns"
+NOIZDNS_KEYS_DIR="$DB_DIR/noizdns"
 BACKUP_DIR="$DB_DIR/backups"
 LOGS_DIR="$DB_DIR/logs"
 CONFIG_DIR="$DB_DIR/config"
@@ -56,6 +58,7 @@ GOST_BIN="/usr/local/bin/gost"
 
 # ========== SERVICE FILES ==========
 GOST_SERVICE="/etc/systemd/system/gost-dns.service"
+DANTE_SERVICE="/etc/systemd/system/danted.service"
 LIMITER_SERVICE="/etc/systemd/system/voltron-limiter.service"
 
 # ========== PORTS ==========
@@ -72,19 +75,20 @@ SOCKS5_PORT=1080
 SSH_PORT=22
 
 # ========== DESEC DNS CONFIGURATION ==========
+# WARNING: Badilisha hizi kwa zako mwenyewe!
 DESEC_TOKEN="3WxD4Hkiu5VYBLWVizVhf1rzyKbz"
 DESEC_DOMAIN="voltrontechtx.shop"
 
 # ========== TUNNEL TAGS AND CONFIGURATION ==========
 declare -A TUNNEL_INFO=(
-    ["dnstt-ssh-01"]="transport:dnstt|backend:ssh|port:$DNSTT_SSH_PORT|service:dnstt-ssh.service|domain_file:dnstt-ssh_domain.txt"
-    ["dnstt-socks-01"]="transport:dnstt|backend:socks|port:$DNSTT_SOCKS_PORT|service:dnstt-socks.service|domain_file:dnstt-socks_domain.txt"
-    ["slip-ssh-01"]="transport:slipstream|backend:ssh|port:$SLIP_SSH_PORT|service:slipstream-ssh.service|domain_file:slip-ssh_domain.txt"
-    ["slip-socks-01"]="transport:slipstream|backend:socks|port:$SLIP_SOCKS_PORT|service:slipstream-socks.service|domain_file:slip-socks_domain.txt"
-    ["vay-ssh-01"]="transport:vaydns|backend:ssh|port:$VAY_SSH_PORT|service:vaydns-ssh.service|domain_file:vay-ssh_domain.txt"
-    ["vay-socks-01"]="transport:vaydns|backend:socks|port:$VAY_SOCKS_PORT|service:vaydns-socks.service|domain_file:vay-socks_domain.txt"
-    ["noiz-ssh-01"]="transport:noizdns|backend:ssh|port:$NOIZ_SSH_PORT|service:noizdns-ssh.service|domain_file:noiz-ssh_domain.txt"
-    ["noiz-socks-01"]="transport:noizdns|backend:socks|port:$NOIZ_SOCKS_PORT|service:noizdns-socks.service|domain_file:noiz-socks_domain.txt"
+    ["dnstt-ssh-01"]="transport:dnstt|backend:ssh|port:$DNSTT_SSH_PORT|service:dnstt-ssh.service|domain_file:dnstt-ssh_domain.txt|keys_dir:$DNSTT_KEYS_DIR"
+    ["dnstt-socks-01"]="transport:dnstt|backend:socks|port:$DNSTT_SOCKS_PORT|service:dnstt-socks.service|domain_file:dnstt-socks_domain.txt|keys_dir:$DNSTT_KEYS_DIR"
+    ["slip-ssh-01"]="transport:slipstream|backend:ssh|port:$SLIP_SSH_PORT|service:slipstream-ssh.service|domain_file:slip-ssh_domain.txt|keys_dir:"
+    ["slip-socks-01"]="transport:slipstream|backend:socks|port:$SLIP_SOCKS_PORT|service:slipstream-socks.service|domain_file:slip-socks_domain.txt|keys_dir:"
+    ["vay-ssh-01"]="transport:vaydns|backend:ssh|port:$VAY_SSH_PORT|service:vaydns-ssh.service|domain_file:vay-ssh_domain.txt|keys_dir:$VAYDNS_KEYS_DIR"
+    ["vay-socks-01"]="transport:vaydns|backend:socks|port:$VAY_SOCKS_PORT|service:vaydns-socks.service|domain_file:vay-socks_domain.txt|keys_dir:$VAYDNS_KEYS_DIR"
+    ["noiz-ssh-01"]="transport:noizdns|backend:ssh|port:$NOIZ_SSH_PORT|service:noizdns-ssh.service|domain_file:noiz-ssh_domain.txt|keys_dir:$NOIZDNS_KEYS_DIR"
+    ["noiz-socks-01"]="transport:noizdns|backend:socks|port:$NOIZ_SOCKS_PORT|service:noizdns-socks.service|domain_file:noiz-socks_domain.txt|keys_dir:$NOIZDNS_KEYS_DIR"
 )
 
 # ========== CACHE FILES ==========
@@ -97,11 +101,13 @@ CACHE_SCRIPT="/usr/local/bin/voltron-cache-clean"
 # ========== CREATE DIRECTORIES ==========
 create_directories() {
     echo -e "${C_BLUE}📁 Creating directories...${C_RESET}"
-    mkdir -p $DB_DIR $DNSTT_KEYS_DIR $BACKUP_DIR $LOGS_DIR $CONFIG_DIR
+    mkdir -p $DB_DIR $DNSTT_KEYS_DIR $VAYDNS_KEYS_DIR $NOIZDNS_KEYS_DIR
+    mkdir -p $BACKUP_DIR $LOGS_DIR $CONFIG_DIR
     mkdir -p $BANDWIDTH_DIR $TRAFFIC_DIR $SSH_BANNER_DIR
     mkdir -p $SSH_TRAFFIC_DIR $SOCKS5_TRAFFIC_DIR
-    mkdir -p "$DB_DIR/cache" /etc/ssh/sshd_config.d
+    mkdir -p "$DB_DIR/cache" /etc/ssh/sshd_config.d /etc/danted
     touch $SSH_USERS_DB $SOCKS5_USERS_DB
+    touch /etc/danted/socks.passwd
 }
 
 # ========== GET IP, LOCATION, ISP ==========
@@ -146,7 +152,7 @@ show_banner() {
     fi
     
     echo -e "${C_BOLD}${C_PURPLE}╔═══════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_BOLD}${C_PURPLE}║           🔥 VOLTRON TECH TUNNEL v5.0 🔥                      ║${C_RESET}"
+    echo -e "${C_BOLD}${C_PURPLE}║           🔥 VOLTRON TECH TUNNEL v6.0 🔥                      ║${C_RESET}"
     echo -e "${C_BOLD}${C_PURPLE}║     DNSTT • SLIPSTREAM • VAYDNS • NOIZDNS • SSH • SOCKS5       ║${C_RESET}"
     echo -e "${C_BOLD}${C_PURPLE}║                   NET2SHARE + FALCON STYLE                    ║${C_RESET}"
     echo -e "${C_BOLD}${C_PURPLE}╠═══════════════════════════════════════════════════════════════╣${C_RESET}"
@@ -248,32 +254,90 @@ download_net2share_binaries() {
         arch="arm64"
     fi
     
+    # DNSTT
     echo -e "${C_CYAN}📥 Downloading DNSTT binary for $arch...${C_RESET}"
     wget -q -O "$DNSTT_SERVER" "https://github.com/net2share/dnstt/releases/latest/download/dnstt-server-linux-${arch}"
     chmod +x "$DNSTT_SERVER"
     echo -e "${C_GREEN}✅ DNSTT binary installed${C_RESET}"
     
+    # Slipstream
     echo -e "${C_CYAN}📥 Downloading Slipstream binary for $arch...${C_RESET}"
     wget -q -O "$SLIPSTREAM_SERVER" "https://github.com/net2share/slipstream-rust/releases/latest/download/slipstream-server-linux-${arch}"
     chmod +x "$SLIPSTREAM_SERVER"
     echo -e "${C_GREEN}✅ Slipstream binary installed${C_RESET}"
     
+    # VayDNS
     echo -e "${C_CYAN}📥 Downloading VayDNS binary for $arch...${C_RESET}"
     wget -q -O "$VAYDNS_SERVER" "https://github.com/net2share/vaydns/releases/latest/download/vaydns-server-linux-${arch}"
     chmod +x "$VAYDNS_SERVER"
     echo -e "${C_GREEN}✅ VayDNS binary installed${C_RESET}"
     
+    # NoizDNS
     echo -e "${C_CYAN}📥 Downloading NoizDNS binary for $arch...${C_RESET}"
     wget -q -O "$NOIZDNS_SERVER" "https://github.com/net2share/noizdns/releases/latest/download/noizdns-server-linux-${arch}"
     chmod +x "$NOIZDNS_SERVER"
     echo -e "${C_GREEN}✅ NoizDNS binary installed${C_RESET}"
     
+    # GOST
     echo -e "${C_CYAN}📥 Downloading GOST DNS proxy...${C_RESET}"
     wget -q -O /tmp/gost.gz "https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-${arch}-2.11.5.gz"
     gunzip -f /tmp/gost.gz
     chmod +x /tmp/gost
     mv /tmp/gost "$GOST_BIN"
     echo -e "${C_GREEN}✅ GOST DNS proxy installed${C_RESET}"
+}
+
+# ========== GENERATE KEYS FOR DNSTT, VAYDNS, NOIZDNS ==========
+generate_all_keys() {
+    echo -e "\n${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_BLUE}           🔑 GENERATING KEYS FOR ALL DNS TUNNELS${C_RESET}"
+    echo -e "${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
+    
+    # DNSTT Keys
+    echo -e "\n${C_CYAN}[1/3] Generating DNSTT keys...${C_RESET}"
+    mkdir -p "$DNSTT_KEYS_DIR"
+    cd "$DNSTT_KEYS_DIR"
+    $DNSTT_SERVER -gen-key -privkey server.key -pubkey server.pub
+    chmod 600 server.key
+    chmod 644 server.pub
+    DNSTT_PUBLIC_KEY=$(cat server.pub)
+    echo -e "${C_GREEN}✅ DNSTT keys generated${C_RESET}"
+    echo -e "   • Public Key: ${DNSTT_PUBLIC_KEY:0:80}..."
+    
+    # VayDNS Keys
+    echo -e "\n${C_CYAN}[2/3] Generating VayDNS keys...${C_RESET}"
+    mkdir -p "$VAYDNS_KEYS_DIR"
+    cd "$VAYDNS_KEYS_DIR"
+    $VAYDNS_SERVER -gen-key -privkey server.key -pubkey server.pub
+    chmod 600 server.key
+    chmod 644 server.pub
+    VAYDNS_PUBLIC_KEY=$(cat server.pub)
+    echo -e "${C_GREEN}✅ VayDNS keys generated${C_RESET}"
+    echo -e "   • Public Key: ${VAYDNS_PUBLIC_KEY:0:80}..."
+    
+    # NoizDNS Keys
+    echo -e "\n${C_CYAN}[3/3] Generating NoizDNS keys...${C_RESET}"
+    mkdir -p "$NOIZDNS_KEYS_DIR"
+    cd "$NOIZDNS_KEYS_DIR"
+    $NOIZDNS_SERVER -gen-key -privkey server.key -pubkey server.pub
+    chmod 600 server.key
+    chmod 644 server.pub
+    NOIZDNS_PUBLIC_KEY=$(cat server.pub)
+    echo -e "${C_GREEN}✅ NoizDNS keys generated${C_RESET}"
+    echo -e "   • Public Key: ${NOIZDNS_PUBLIC_KEY:0:80}..."
+    
+    # Save all public keys to a file
+    cat > "$DB_DIR/all_public_keys.txt" << EOF
+=== DNSTT PUBLIC KEY ===
+$DNSTT_PUBLIC_KEY
+
+=== VAYDNS PUBLIC KEY ===
+$VAYDNS_PUBLIC_KEY
+
+=== NOIZDNS PUBLIC KEY ===
+$NOIZDNS_PUBLIC_KEY
+EOF
+    echo -e "\n${C_GREEN}✅ All public keys saved to $DB_DIR/all_public_keys.txt${C_RESET}"
 }
 
 # ========== DESEC DNS DOMAIN GENERATOR ==========
@@ -291,16 +355,28 @@ generate_desec_domain() {
     fi
     
     echo -e "${C_CYAN}Creating A record: ${ns_subdomain}.${DESEC_DOMAIN} → ${SERVER_IPV4}${C_RESET}"
-    curl -s -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
+    RESPONSE=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
         -H "Authorization: Token $DESEC_TOKEN" \
         -H "Content-Type: application/json" \
-        --data "[{\"subname\":\"$ns_subdomain\",\"type\":\"A\",\"ttl\":3600,\"records\":[\"$SERVER_IPV4\"]}]" > /dev/null
+        --data "[{\"subname\":\"$ns_subdomain\",\"type\":\"A\",\"ttl\":3600,\"records\":[\"$SERVER_IPV4\"]}]")
+    
+    HTTP_CODE=${RESPONSE: -3}
+    if [[ "$HTTP_CODE" != "201" ]]; then
+        echo -e "${C_RED}❌ Failed to create A record! HTTP $HTTP_CODE${C_RESET}"
+        return 1
+    fi
     
     echo -e "${C_CYAN}Creating NS record: ${tun_subdomain}.${DESEC_DOMAIN} → ${ns_subdomain}.${DESEC_DOMAIN}${C_RESET}"
-    curl -s -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
+    RESPONSE=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
         -H "Authorization: Token $DESEC_TOKEN" \
         -H "Content-Type: application/json" \
-        --data "[{\"subname\":\"$tun_subdomain\",\"type\":\"NS\",\"ttl\":3600,\"records\":[\"${ns_subdomain}.${DESEC_DOMAIN}.\"]}]" > /dev/null
+        --data "[{\"subname\":\"$tun_subdomain\",\"type\":\"NS\",\"ttl\":3600,\"records\":[\"${ns_subdomain}.${DESEC_DOMAIN}.\"]}]")
+    
+    HTTP_CODE=${RESPONSE: -3}
+    if [[ "$HTTP_CODE" != "201" ]]; then
+        echo -e "${C_RED}❌ Failed to create NS record! HTTP $HTTP_CODE${C_RESET}"
+        return 1
+    fi
     
     local FULL_DOMAIN="${tun_subdomain}.${DESEC_DOMAIN}"
     
@@ -310,26 +386,6 @@ generate_desec_domain() {
     
     echo -e "${C_GREEN}✅ Domain generated: ${C_YELLOW}$FULL_DOMAIN${C_RESET}"
     echo "$FULL_DOMAIN"
-}
-
-# ========== DNSTT KEY GENERATION ==========
-generate_dnstt_keys() {
-    echo -e "\n${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "${C_BLUE}           🔑 GENERATING DNSTT KEYS${C_RESET}"
-    echo -e "${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
-    
-    mkdir -p "$DNSTT_KEYS_DIR"
-    cd "$DNSTT_KEYS_DIR"
-    
-    $DNSTT_SERVER -gen-key -privkey server.key -pubkey server.pub
-    
-    chmod 600 server.key
-    chmod 644 server.pub
-    
-    PUBLIC_KEY=$(cat server.pub)
-    echo -e "${C_GREEN}✅ DNSTT keys generated${C_RESET}"
-    echo -e "   • Private key: $DNSTT_KEYS_DIR/server.key"
-    echo -e "   • Public key: $DNSTT_KEYS_DIR/server.pub"
 }
 
 # ========== CREATE TUNNEL SERVICE ==========
@@ -343,11 +399,13 @@ create_tunnel_service() {
     local binary=""
     local exec_start=""
     local service_name=""
+    local keys_dir=""
     
     case $transport in
         dnstt)
             binary="$DNSTT_SERVER"
-            exec_start="$binary -udp :$port -privkey $DNSTT_KEYS_DIR/server.key -domain $domain $target"
+            keys_dir="$DNSTT_KEYS_DIR"
+            exec_start="$binary -udp :$port -privkey $keys_dir/server.key -domain $domain $target"
             service_name="dnstt-${backend}.service"
             ;;
         slipstream)
@@ -357,12 +415,14 @@ create_tunnel_service() {
             ;;
         vaydns)
             binary="$VAYDNS_SERVER"
-            exec_start="$binary -udp :$port -domain $domain -upstream $target"
+            keys_dir="$VAYDNS_KEYS_DIR"
+            exec_start="$binary -udp :$port -privkey $keys_dir/server.key -domain $domain $target"
             service_name="vaydns-${backend}.service"
             ;;
         noizdns)
             binary="$NOIZDNS_SERVER"
-            exec_start="$binary -udp :$port -domain $domain -upstream $target"
+            keys_dir="$NOIZDNS_KEYS_DIR"
+            exec_start="$binary -udp :$port -privkey $keys_dir/server.key -domain $domain $target"
             service_name="noizdns-${backend}.service"
             ;;
     esac
@@ -385,6 +445,18 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "${service_name}"
+    systemctl start "${service_name}"
+    
+    # Check if service started successfully
+    sleep 2
+    if systemctl is-active --quiet "${service_name}"; then
+        echo -e "${C_GREEN}✅ ${transport^^} + $backend tunnel started on port $port${C_RESET}"
+        return 0
+    else
+        echo -e "${C_RED}❌ ${transport^^} + $backend tunnel failed to start${C_RESET}"
+        journalctl -u "${service_name}" -n 10 --no-pager
+        return 1
+    fi
     
     echo -e "${C_GREEN}✅ ${transport^^} + $backend tunnel created on port $port${C_RESET}"
 }
@@ -432,8 +504,83 @@ EOF
 
     systemctl daemon-reload
     systemctl enable gost-dns.service
+    systemctl start gost-dns.service
+    
+    sleep 2
+    if systemctl is-active --quiet gost-dns.service; then
+        echo -e "${C_GREEN}✅ DNS Proxy configured on port $DNS_PORT${C_RESET}"
+    else
+        echo -e "${C_RED}❌ DNS Proxy failed to start${C_RESET}"
+        journalctl -u gost-dns.service -n 10 --no-pager
+        return 1
+    fi
     
     echo -e "${C_GREEN}✅ DNS Proxy configured on port $DNS_PORT${C_RESET}"
+}
+
+# ========== CONFIGURE SOCKS5 (DANTE) ==========
+configure_socks5() {
+    echo -e "\n${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_BLUE}           🔧 CONFIGURING SOCKS5 PROXY (DANTE)${C_RESET}"
+    echo -e "${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
+    
+    # Create Dante config
+    cat > /etc/danted.conf << 'EOF'
+logoutput: syslog
+internal: 0.0.0.0 port=1080
+external: eth0
+method: username
+user.privileged: root
+user.notprivileged: nobody
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
+}
+
+pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    method: username
+}
+EOF
+
+    # Create password file if empty
+    if [ ! -s /etc/danted/socks.passwd ]; then
+        echo "test:test123" > /etc/danted/socks.passwd
+    fi
+    
+    # Create systemd service for Dante if not exists
+    if [ ! -f /etc/systemd/system/danted.service ]; then
+        cat > /etc/systemd/system/danted.service << 'EOF'
+[Unit]
+Description=Dante SOCKS5 Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/danted -f /etc/danted.conf
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    
+    systemctl daemon-reload
+    systemctl enable danted
+    systemctl restart danted
+    
+    sleep 2
+    if systemctl is-active --quiet danted; then
+        echo -e "${C_GREEN}✅ SOCKS5 Proxy configured on port $SOCKS5_PORT${C_RESET}"
+    else
+        echo -e "${C_RED}❌ SOCKS5 Proxy failed to start${C_RESET}"
+        journalctl -u danted -n 10 --no-pager
+        return 1
+    fi
 }
 
 # ========== FIREWALL CONFIGURATION ==========
@@ -442,18 +589,31 @@ configure_firewall() {
     echo -e "${C_BLUE}           🔥 CONFIGURING FIREWALL${C_RESET}"
     echo -e "${C_BLUE}═══════════════════════════════════════════════════════════════${C_RESET}"
     
+    # Stop systemd-resolved
     systemctl stop systemd-resolved 2>/dev/null
     systemctl disable systemd-resolved 2>/dev/null
     
+    # Clear existing rules
     iptables -t nat -F PREROUTING 2>/dev/null
     iptables -F 2>/dev/null
     
+    # Redirect DNS queries to GOST
     iptables -t nat -I PREROUTING 1 -p udp --dport 53 -j REDIRECT --to-port 53
     
+    # Open necessary ports
     iptables -I INPUT 1 -p udp --dport 53 -j ACCEPT
     iptables -I INPUT 2 -p tcp --dport 22 -j ACCEPT
     iptables -I INPUT 2 -p tcp --dport 1080 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5301 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5302 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5303 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5304 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5305 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5306 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5307 -j ACCEPT
+    iptables -I INPUT 3 -p udp --dport 5308 -j ACCEPT
     
+    # Save rules
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
     
@@ -461,6 +621,7 @@ configure_firewall() {
     echo -e "   • Port 53: Redirected to GOST DNS Proxy"
     echo -e "   • Port 22: SSH (open)"
     echo -e "   • Port 1080: SOCKS5 (open)"
+    echo -e "   • Ports 5301-5308: Internal tunnels (open)"
 }
 
 # ========== SPEED BOOSTERS (7 LEVELS) ==========
@@ -476,12 +637,6 @@ apply_dnstt_standard() {
     sysctl -w net.netfilter.nf_conntrack_max=4000000 >/dev/null 2>&1
     ulimit -n 1048576 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Standard Booster applied! (10-15 Mbps)${C_RESET}"
 }
@@ -499,12 +654,6 @@ apply_dnstt_medium() {
     sysctl -w net.netfilter.nf_conntrack_max=4000000 >/dev/null 2>&1
     ulimit -n 1048576 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Medium Booster applied! (15-20 Mbps) 🚀${C_RESET}"
 }
@@ -522,12 +671,6 @@ apply_dnstt_high() {
     sysctl -w net.netfilter.nf_conntrack_max=8000000 >/dev/null 2>&1
     ulimit -n 2097152 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ High Booster applied! (20-25 Mbps) 🚀🚀${C_RESET}"
 }
@@ -545,12 +688,6 @@ apply_dnstt_ultra() {
     sysctl -w net.netfilter.nf_conntrack_max=16000000 >/dev/null 2>&1
     ulimit -n 4194304 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Ultra Booster applied! (25-35 Mbps) 🚀🚀🚀${C_RESET}"
 }
@@ -568,12 +705,6 @@ apply_dnstt_extreme() {
     sysctl -w net.netfilter.nf_conntrack_max=32000000 >/dev/null 2>&1
     ulimit -n 8388608 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Extreme Booster applied! (35-50 Mbps) 💥💥💥${C_RESET}"
 }
@@ -591,12 +722,6 @@ apply_dnstt_ultra_plus() {
     sysctl -w net.netfilter.nf_conntrack_max=24000000 >/dev/null 2>&1
     ulimit -n 6291456 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Ultra Plus Booster applied! (40-60 Mbps) 🚀🚀🚀🚀${C_RESET}"
 }
@@ -614,12 +739,6 @@ apply_dnstt_extreme_plus() {
     sysctl -w net.netfilter.nf_conntrack_max=48000000 >/dev/null 2>&1
     ulimit -n 12582912 2>/dev/null
     sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_dsack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fack=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
     echo -e "${C_GREEN}✅ Extreme Plus Booster applied! (60-100 Mbps) 💥💥💥💥💥${C_RESET}"
 }
@@ -722,9 +841,23 @@ add_tunnel_wizard() {
     if [[ "$domain_choice" == "1" ]]; then
         echo -e "\n${C_BLUE}🔍 Auto-generating domain with deSEC...${C_RESET}"
         
-        local tunnel_tag="${TRANSPORT}-ssh"
-        if [[ "$domain_choice" == "2" ]]; then
-            tunnel_tag="${TRANSPORT}-socks"
+        local tunnel_tag=""
+        if [[ "$TRANSPORT" == "dnstt" ]] && [[ "$BACKEND" == "ssh" ]]; then
+            tunnel_tag="dnstt-ssh"
+        elif [[ "$TRANSPORT" == "dnstt" ]] && [[ "$BACKEND" == "socks" ]]; then
+            tunnel_tag="dnstt-socks"
+        elif [[ "$TRANSPORT" == "slipstream" ]] && [[ "$BACKEND" == "ssh" ]]; then
+            tunnel_tag="slip-ssh"
+        elif [[ "$TRANSPORT" == "slipstream" ]] && [[ "$BACKEND" == "socks" ]]; then
+            tunnel_tag="slip-socks"
+        elif [[ "$TRANSPORT" == "vaydns" ]] && [[ "$BACKEND" == "ssh" ]]; then
+            tunnel_tag="vay-ssh"
+        elif [[ "$TRANSPORT" == "vaydns" ]] && [[ "$BACKEND" == "socks" ]]; then
+            tunnel_tag="vay-socks"
+        elif [[ "$TRANSPORT" == "noizdns" ]] && [[ "$BACKEND" == "ssh" ]]; then
+            tunnel_tag="noiz-ssh"
+        elif [[ "$TRANSPORT" == "noizdns" ]] && [[ "$BACKEND" == "socks" ]]; then
+            tunnel_tag="noiz-socks"
         fi
         
         DOMAIN=$(generate_desec_domain "$tunnel_tag")
@@ -824,22 +957,32 @@ add_tunnel_wizard() {
     # Save domain
     echo "$DOMAIN" > "$DB_DIR/$domain_file"
     
-    create_tunnel_service "$TRANSPORT" "$BACKEND" "$DOMAIN" "$port" "$BACKEND_TARGET"
-    
-    echo -e "\n${C_GREEN}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "${C_GREEN}           ✅ TUNNEL CREATED SUCCESSFULLY!${C_RESET}"
-    echo -e "${C_GREEN}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "  ${C_YELLOW}Transport:${C_RESET}      $TRANSPORT_NAME"
-    echo -e "  ${C_YELLOW}Backend:${C_RESET}        $BACKEND -> $BACKEND_TARGET"
-    echo -e "  ${C_YELLOW}Domain:${C_RESET}         $DOMAIN"
-    echo -e "  ${C_YELLOW}Port:${C_RESET}           $DNS_PORT (UDP)"
-    
-    if [[ "$TRANSPORT" == "dnstt" ]] && [[ -f "$DNSTT_KEYS_DIR/server.pub" ]]; then
-        local pubkey=$(cat "$DNSTT_KEYS_DIR/server.pub" | head -c 50)
-        echo -e "  ${C_YELLOW}Public Key:${C_RESET}    ${pubkey}..."
+    if create_tunnel_service "$TRANSPORT" "$BACKEND" "$DOMAIN" "$port" "$BACKEND_TARGET"; then
+        echo -e "\n${C_GREEN}═══════════════════════════════════════════════════════════════${C_RESET}"
+        echo -e "${C_GREEN}           ✅ TUNNEL CREATED SUCCESSFULLY!${C_RESET}"
+        echo -e "${C_GREEN}═══════════════════════════════════════════════════════════════${C_RESET}"
+        echo -e "  ${C_YELLOW}Transport:${C_RESET}      $TRANSPORT_NAME"
+        echo -e "  ${C_YELLOW}Backend:${C_RESET}        $BACKEND -> $BACKEND_TARGET"
+        echo -e "  ${C_YELLOW}Domain:${C_RESET}         $DOMAIN"
+        echo -e "  ${C_YELLOW}Port:${C_RESET}           $DNS_PORT (UDP)"
+        
+        if [[ "$TRANSPORT" == "dnstt" ]] && [[ -f "$DNSTT_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$DNSTT_KEYS_DIR/server.pub" | head -c 50)
+            echo -e "  ${C_YELLOW}Public Key:${C_RESET}    ${pubkey}..."
+        fi
+        if [[ "$TRANSPORT" == "vaydns" ]] && [[ -f "$VAYDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$VAYDNS_KEYS_DIR/server.pub" | head -c 50)
+            echo -e "  ${C_YELLOW}Public Key:${C_RESET}    ${pubkey}..."
+        fi
+        if [[ "$TRANSPORT" == "noizdns" ]] && [[ -f "$NOIZDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$NOIZDNS_KEYS_DIR/server.pub" | head -c 50)
+            echo -e "  ${C_YELLOW}Public Key:${C_RESET}    ${pubkey}..."
+        fi
+        
+        echo -e "\n${C_CYAN}📌 Client can now connect using domain: $DOMAIN${C_RESET}"
+    else
+        echo -e "\n${C_RED}❌ Failed to create tunnel${C_RESET}"
     fi
-    
-    echo -e "\n${C_CYAN}📌 Client can now connect using domain: $DOMAIN${C_RESET}"
     
     safe_read "" dummy
 }
@@ -942,18 +1085,19 @@ list_active_tunnels() {
             local transport=$(echo "$config" | grep -oP 'transport:\K[^|]+')
             local backend=$(echo "$config" | grep -oP 'backend:\K[^|]+')
             local domain_file=$(echo "$config" | grep -oP 'domain_file:\K[^|]+')
+            local keys_dir=$(echo "$config" | grep -oP 'keys_dir:\K[^|]+')
             
             case $action_choice in
                 1) 
                     echo -e "\n${C_CYAN}=== TUNNEL DETAILS: $selected_tag ===${C_RESET}"
                     echo -e "  Transport: ${transport^^}"
                     echo -e "  Backend: ${backend^^}"
-                    echo -e "  Status: $(systemctl is-active "$service" 2>/dev/null)"
+                    echo -e "  Status: $(systemctl is-active "$service" 2>/dev/null && echo "RUNNING" || echo "STOPPED")"
                     if [[ -f "$DB_DIR/$domain_file" ]]; then
                         echo -e "  Domain: $(cat "$DB_DIR/$domain_file")"
                     fi
-                    if [[ "$transport" == "dnstt" && -f "$DNSTT_KEYS_DIR/server.pub" ]]; then
-                        echo -e "  Public Key: $(cat "$DNSTT_KEYS_DIR/server.pub" | head -c 80)..."
+                    if [[ -n "$keys_dir" && -f "$keys_dir/server.pub" ]]; then
+                        echo -e "  Public Key: $(cat "$keys_dir/server.pub")"
                     fi
                     ;;
                 2) systemctl start "$service"
@@ -975,8 +1119,8 @@ list_active_tunnels() {
                         local domain=$(cat "$DB_DIR/$domain_file")
                         echo -e "  Domain: $domain"
                         echo -e "  Port: $DNS_PORT"
-                        if [[ "$transport" == "dnstt" && -f "$DNSTT_KEYS_DIR/server.pub" ]]; then
-                            echo -e "  Public Key: $(cat "$DNSTT_KEYS_DIR/server.pub")"
+                        if [[ -n "$keys_dir" && -f "$keys_dir/server.pub" ]]; then
+                            echo -e "  Public Key: $(cat "$keys_dir/server.pub")"
                         fi
                     else
                         echo -e "  Domain: Configured via custom domain"
@@ -1327,7 +1471,6 @@ _generate_socks5_client_config() {
     local username=$1
     local password=$2
     
-    # Get user details
     local line=$(grep "^$username:" "$SOCKS5_USERS_DB" 2>/dev/null)
     local expiry=$(echo "$line" | cut -d: -f3)
     local limit=$(echo "$line" | cut -d: -f4)
@@ -1391,6 +1534,10 @@ _generate_socks5_client_config() {
         echo -e "\n${C_GREEN}🔹 VAYDNS + SOCKS5 TUNNEL:${C_RESET}"
         echo -e "   • Domain: $vay_domain"
         echo -e "   • Port: 53 (UDP)"
+        if [[ -f "$VAYDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$VAYDNS_KEYS_DIR/server.pub")
+            echo -e "   • Public Key: ${pubkey:0:80}..."
+        fi
         echo -e "   • SOCKS5 After Tunnel: 127.0.0.1:$SOCKS5_PORT"
         echo -e "   • Username: $username"
         echo -e "   • Password: $password"
@@ -1402,6 +1549,10 @@ _generate_socks5_client_config() {
         echo -e "\n${C_GREEN}🔹 NOIZDNS + SOCKS5 TUNNEL:${C_RESET}"
         echo -e "   • Domain: $noiz_domain"
         echo -e "   • Port: 53 (UDP)"
+        if [[ -f "$NOIZDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$NOIZDNS_KEYS_DIR/server.pub")
+            echo -e "   • Public Key: ${pubkey:0:80}..."
+        fi
         echo -e "   • SOCKS5 After Tunnel: 127.0.0.1:$SOCKS5_PORT"
         echo -e "   • Username: $username"
         echo -e "   • Password: $password"
@@ -1950,6 +2101,10 @@ _generate_ssh_client_config() {
         echo -e "\n${C_GREEN}🔹 VAYDNS + SSH TUNNEL:${C_RESET}"
         echo -e "   • Domain: $vay_domain"
         echo -e "   • Port: 53 (UDP)"
+        if [[ -f "$VAYDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$VAYDNS_KEYS_DIR/server.pub")
+            echo -e "   • Public Key: ${pubkey:0:80}..."
+        fi
         echo -e "   • Username: $username"
         echo -e "   • Password: $password"
     fi
@@ -1959,6 +2114,10 @@ _generate_ssh_client_config() {
         echo -e "\n${C_GREEN}🔹 NOIZDNS + SSH TUNNEL:${C_RESET}"
         echo -e "   • Domain: $noiz_domain"
         echo -e "   • Port: 53 (UDP)"
+        if [[ -f "$NOIZDNS_KEYS_DIR/server.pub" ]]; then
+            local pubkey=$(cat "$NOIZDNS_KEYS_DIR/server.pub")
+            echo -e "   • Public Key: ${pubkey:0:80}..."
+        fi
         echo -e "   • Username: $username"
         echo -e "   • Password: $password"
     fi
@@ -2373,15 +2532,18 @@ initial_setup() {
     create_directories
     install_dependencies
     download_net2share_binaries
-    generate_dnstt_keys
+    generate_all_keys
     configure_dns_proxy
+    configure_socks5
     configure_firewall
     
     systemctl start gost-dns.service
+    systemctl start danted
     
     echo -e "\n${C_GREEN}✅ Initial setup complete!${C_RESET}"
     echo -e "  📌 All tunnels will be accessible via PORT $DNS_PORT"
     echo -e "  📌 Use 'Add New Tunnel' to create your first tunnel"
+    echo -e "  📌 Public keys saved to: $DB_DIR/all_public_keys.txt"
 }
 
 # ========== MAIN MENU ==========
