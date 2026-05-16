@@ -52,7 +52,7 @@ elif [ "$PKG_MANAGER" = "yum" ]; then
 fi
 
 # ========== DOWNLOAD MAIN SCRIPT ==========
-MAIN_SCRIPT_URL="https://raw.githubusercontent.com/VOLTRON-TECH-X/VOLTRON-TECH-X/refs/heads/main/main.sh"
+MAIN_SCRIPT_URL="https://raw.githubusercontent.com/VOLTRON-TECH-X/ALL-DNS-TUNNEL/refs/heads/main/main.sh"
 INSTALL_PATH="/usr/local/bin/voltron"
 
 echo -e "${YELLOW}⬇️ Downloading VOLTRON TECH X main script...${NC}"
