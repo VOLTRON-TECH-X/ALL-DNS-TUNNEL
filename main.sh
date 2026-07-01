@@ -16,6 +16,7 @@
 # - Kila tunnel ina DNS port na Backend port yake tofauti
 # - List Tunnels kwa mtindo wa namba
 # - Auto-install binaries (hakuna option [1])
+# - GOST v2.12.0 (latest)
 # ============================================================================
 
 set -euo pipefail
@@ -73,9 +74,9 @@ BACKEND_PORT_START=30000
 # microsocks (SOCKS5)
 MICROSOCKS_URL="https://github.com/rofl0r/microsocks/releases/latest/download/microsocks"
 
-# GOST DNS Router
-GOST_URL_X86="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-amd64-2.11.5.tar.gz"
-GOST_URL_ARM="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-arm64-2.11.5.tar.gz"
+# GOST DNS Router v2.12.0 (NEW!)
+GOST_URL_X86="https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_amd64.tar.gz"
+GOST_URL_ARM="https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_arm64.tar.gz"
 
 # DNSTT (kutoka Falcon - dnstt.network)
 DNSTT_URL_X86="https://dnstt.network/dnstt-server-linux-amd64"
@@ -170,13 +171,13 @@ install_binaries() {
     local SLIPSTREAM_URL=""
     
     if [[ "$arch" == "x86_64" ]]; then
-        SUFFIX="linux-amd64"
+        SUFFIX="amd64"
         GOST_URL="$GOST_URL_X86"
         DNSTT_URL="$DNSTT_URL_X86"
         DNSTT_CLIENT_URL="$DNSTT_CLIENT_X86"
         SLIPSTREAM_URL="$SLIPSTREAM_URL_X86"
     elif [[ "$arch" == "aarch64" ]] || [[ "$arch" == "arm64" ]]; then
-        SUFFIX="linux-arm64"
+        SUFFIX="arm64"
         GOST_URL="$GOST_URL_ARM"
         DNSTT_URL="$DNSTT_URL_ARM"
         DNSTT_CLIENT_URL="$DNSTT_CLIENT_ARM"
@@ -211,22 +212,41 @@ install_binaries() {
         success "microsocks already installed"
     fi
     
-    # ---- 1.2 GOST DNS Router ----
-    log "Installing GOST DNS Router..."
+    # ---- 1.2 GOST DNS Router v2.12.0 ----
+    log "Installing GOST DNS Router v2.12.0..."
     if ! command -v gost &>/dev/null; then
-        if wget -q "$GOST_URL" -O /tmp/gost.tar.gz; then
+        echo -e "${C_BLUE}📥 Downloading GOST v2.12.0...${C_RESET}"
+        
+        if wget -q --show-progress "$GOST_URL" -O /tmp/gost.tar.gz; then
             tar -xzf /tmp/gost.tar.gz -C /tmp
-            cp "/tmp/gost_2.11.5_${SUFFIX}/gost" "$BIN_DIR/gost" 2>/dev/null || \
-            cp "/tmp/gost" "$BIN_DIR/gost" 2>/dev/null || true
+            
+            # Tafuta binary ya gost
+            if [[ -f "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" ]]; then
+                cp "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" "$BIN_DIR/gost"
+            elif [[ -f "/tmp/gost" ]]; then
+                cp "/tmp/gost" "$BIN_DIR/gost"
+            else
+                # Jaribu kutafuta binary yoyote
+                find /tmp -name "gost" -type f -executable | head -1 | xargs -I {} cp {} "$BIN_DIR/gost"
+            fi
+            
             chmod +x "$BIN_DIR/gost"
             rm -rf /tmp/gost*
-            success "GOST installed"
+            
+            if command -v gost &>/dev/null; then
+                local gost_version=$(gost -V 2>&1 | head -1 || echo "v2.12.0")
+                success "GOST installed: $gost_version"
+            else
+                echo -e "${C_RED}❌ Failed to install GOST binary${C_RESET}"
+                return 1
+            fi
         else
             echo -e "${C_RED}❌ Failed to download GOST${C_RESET}"
             return 1
         fi
     else
-        success "GOST already installed"
+        local gost_version=$(gost -V 2>&1 | head -1 || echo "unknown")
+        success "GOST already installed: $gost_version"
     fi
     
     # ---- 1.3 DNSTT Server (Falcon style) ----
