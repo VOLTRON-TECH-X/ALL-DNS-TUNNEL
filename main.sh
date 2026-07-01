@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# VOLTRON GATE v7.2 (DNSTM STYLE)
+# VOLTRON GATE v7.3 (DNSTM STYLE - PRE-COMPILED BINARIES)
 # - Bandwidth monitoring kwa SSH na SOCKS5 users
 # - Data limiter (auto-lock when quota exceeded)
 # - Expiry date kwa users
@@ -15,6 +15,7 @@
 # - Command: menu au voltron
 # - Kila tunnel ina DNS port na Backend port yake tofauti
 # - List Tunnels kwa mtindo wa namba
+# - Auto-install binaries (hakuna option [1])
 # ============================================================================
 
 set -euo pipefail
@@ -57,6 +58,7 @@ MICROSOCKS_AUTH="$DB_DIR/microsocks.auth"
 SSHD_FF_CONFIG="/etc/ssh/sshd_config.d/voltron-banner.conf"
 FF_USERS_GROUP="ffusers"
 CONFIG_DIR="$DB_DIR/configs"
+INSTALL_FLAG="$DB_DIR/.installed"
 
 # ========== PORTS ==========
 SOCKS5_PORT=1080
@@ -66,6 +68,24 @@ SSH_PORT=22
 # ========== PORT RANGES ==========
 TUNNEL_PORT_START=5300
 BACKEND_PORT_START=30000
+
+# ========== BINARY URLS (PRE-COMPILED) ==========
+# microsocks (SOCKS5)
+MICROSOCKS_URL="https://github.com/rofl0r/microsocks/releases/latest/download/microsocks"
+
+# GOST DNS Router
+GOST_URL_X86="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-amd64-2.11.5.tar.gz"
+GOST_URL_ARM="https://github.com/ginuerzh/gost/releases/latest/download/gost-linux-arm64-2.11.5.tar.gz"
+
+# DNSTT (kutoka Falcon - dnstt.network)
+DNSTT_URL_X86="https://dnstt.network/dnstt-server-linux-amd64"
+DNSTT_URL_ARM="https://dnstt.network/dnstt-server-linux-arm64"
+DNSTT_CLIENT_X86="https://dnstt.network/dnstt-client-linux-amd64"
+DNSTT_CLIENT_ARM="https://dnstt.network/dnstt-client-linux-arm64"
+
+# Slipstream (kutoka Falcon - slipgate releases)
+SLIPSTREAM_URL_X86="https://github.com/anonvector/slipgate/releases/latest/download/slipstream-server-linux-amd64"
+SLIPSTREAM_URL_ARM="https://github.com/anonvector/slipgate/releases/latest/download/slipstream-server-linux-arm64"
 
 # ========== CREATE DIRECTORIES ==========
 mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR
@@ -136,48 +156,57 @@ find_unique_port() {
     done
 }
 
-# ========== 1. INSTALL BINARIES (IMPROVED) ==========
+# ========== 1. AUTO-INSTALL BINARIES (PRE-COMPILED) ==========
 install_binaries() {
-    log "📥 Installing DNS tunnel binaries..."
+    log "📥 Installing DNS tunnel binaries (pre-compiled)..."
     
-    # ---- Check and install dependencies ----
-    echo -e "${C_BLUE}🔧 Checking dependencies...${C_RESET}"
-    local deps=("curl" "wget" "git" "make" "gcc" "openssl" "build-essential")
-    local missing=()
+    # ---- Check architecture ----
+    local arch
+    arch=$(uname -m)
+    local SUFFIX=""
+    local GOST_URL=""
+    local DNSTT_URL=""
+    local DNSTT_CLIENT_URL=""
+    local SLIPSTREAM_URL=""
     
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing+=("$dep")
-        fi
-    done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${C_YELLOW}⚠️ Installing missing dependencies: ${missing[*]}${C_RESET}"
-        apt update && apt install -y "${missing[@]}"
+    if [[ "$arch" == "x86_64" ]]; then
+        SUFFIX="linux-amd64"
+        GOST_URL="$GOST_URL_X86"
+        DNSTT_URL="$DNSTT_URL_X86"
+        DNSTT_CLIENT_URL="$DNSTT_CLIENT_X86"
+        SLIPSTREAM_URL="$SLIPSTREAM_URL_X86"
+    elif [[ "$arch" == "aarch64" ]] || [[ "$arch" == "arm64" ]]; then
+        SUFFIX="linux-arm64"
+        GOST_URL="$GOST_URL_ARM"
+        DNSTT_URL="$DNSTT_URL_ARM"
+        DNSTT_CLIENT_URL="$DNSTT_CLIENT_ARM"
+        SLIPSTREAM_URL="$SLIPSTREAM_URL_ARM"
+    else
+        echo -e "${C_RED}❌ Unsupported architecture: $arch${C_RESET}"
+        return 1
     fi
+    
+    echo -e "${C_DIM}📐 Architecture detected: $arch${C_RESET}\n"
+    
+    # ---- Install dependencies ----
+    log "Installing dependencies..."
+    apt update && apt install -y curl wget bc iptables net-tools unzip
     
     # ---- Create user ----
     if ! id "voltrondns" &>/dev/null; then
         useradd -r -s /usr/sbin/nologin voltrondns
     fi
     
-    # ---- Backup existing binaries ----
-    echo -e "${C_BLUE}💾 Backing up existing binaries...${C_RESET}"
-    for bin in microsocks gost dnstt-server slipstream-server; do
-        if [[ -f "$BIN_DIR/$bin" ]]; then
-            cp "$BIN_DIR/$bin" "$BIN_DIR/${bin}.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-        fi
-    done
-    
-    # ---- 1.1 microsocks ----
+    # ---- 1.1 microsocks (SOCKS5) ----
     log "Installing microsocks..."
     if ! command -v microsocks &>/dev/null; then
-        cd /tmp
-        git clone https://github.com/rofl0r/microsocks.git 2>/dev/null || true
-        cd microsocks
-        make && make install
-        cd /tmp && rm -rf microsocks
-        success "microsocks installed"
+        if wget -q "$MICROSOCKS_URL" -O "$BIN_DIR/microsocks"; then
+            chmod +x "$BIN_DIR/microsocks"
+            success "microsocks installed"
+        else
+            echo -e "${C_RED}❌ Failed to download microsocks${C_RESET}"
+            return 1
+        fi
     else
         success "microsocks already installed"
     fi
@@ -185,17 +214,13 @@ install_binaries() {
     # ---- 1.2 GOST DNS Router ----
     log "Installing GOST DNS Router..."
     if ! command -v gost &>/dev/null; then
-        local gost_version="2.11.5"
-        local arch="linux_amd64"
-        [[ $(uname -m) == "aarch64" ]] && arch="linux_arm64"
-        
-        if wget -q "https://github.com/ginuerzh/gost/releases/download/v${gost_version}/gost-${gost_version}-${arch}.tar.gz" -O /tmp/gost.tar.gz; then
+        if wget -q "$GOST_URL" -O /tmp/gost.tar.gz; then
             tar -xzf /tmp/gost.tar.gz -C /tmp
-            cp "/tmp/gost_${gost_version}_linux_amd64/gost" "$BIN_DIR/gost" 2>/dev/null || \
+            cp "/tmp/gost_2.11.5_${SUFFIX}/gost" "$BIN_DIR/gost" 2>/dev/null || \
             cp "/tmp/gost" "$BIN_DIR/gost" 2>/dev/null || true
             chmod +x "$BIN_DIR/gost"
             rm -rf /tmp/gost*
-            success "GOST installed: v${gost_version}"
+            success "GOST installed"
         else
             echo -e "${C_RED}❌ Failed to download GOST${C_RESET}"
             return 1
@@ -204,40 +229,41 @@ install_binaries() {
         success "GOST already installed"
     fi
     
-    # ---- 1.3 DNSTT Server ----
+    # ---- 1.3 DNSTT Server (Falcon style) ----
     log "Installing DNSTT server..."
     if ! command -v dnstt-server &>/dev/null; then
-        cd /tmp
-        if git clone https://www.bamsoftware.com/git/dnstt.git 2>/dev/null; then
-            cd dnstt
-            if make; then
-                cp dnstt-server "$BIN_DIR/"
-                cp dnstt-client "$BIN_DIR/"
-                success "DNSTT installed successfully"
-            else
-                echo -e "${C_RED}❌ Failed to compile DNSTT${C_RESET}"
-                cd /tmp && rm -rf dnstt
-                return 1
-            fi
-            cd /tmp && rm -rf dnstt
+        if wget -q "$DNSTT_URL" -O "$BIN_DIR/dnstt-server"; then
+            chmod +x "$BIN_DIR/dnstt-server"
+            success "DNSTT server installed"
         else
-            echo -e "${C_RED}❌ Failed to clone DNSTT repository${C_RESET}"
+            echo -e "${C_RED}❌ Failed to download DNSTT server${C_RESET}"
             return 1
         fi
     else
-        success "DNSTT already installed"
+        success "DNSTT server already installed"
     fi
     
-    # ---- 1.4 Slipstream Server ----
+    # ---- 1.4 DNSTT Client ----
+    log "Installing DNSTT client..."
+    if ! command -v dnstt-client &>/dev/null; then
+        if wget -q "$DNSTT_CLIENT_URL" -O "$BIN_DIR/dnstt-client"; then
+            chmod +x "$BIN_DIR/dnstt-client"
+            success "DNSTT client installed"
+        else
+            echo -e "${C_YELLOW}⚠️ Failed to download DNSTT client (optional)${C_RESET}"
+        fi
+    else
+        success "DNSTT client already installed"
+    fi
+    
+    # ---- 1.5 Slipstream Server (Falcon style) ----
     log "Installing Slipstream server..."
     if ! command -v slipstream-server &>/dev/null; then
-        cd /tmp
-        if wget -q https://github.com/anonvector/slipstream/releases/latest/download/slipstream-server -O slipstream-server; then
-            chmod +x slipstream-server
-            mv slipstream-server "$BIN_DIR/"
-            success "Slipstream installed successfully"
+        if wget -q "$SLIPSTREAM_URL" -O "$BIN_DIR/slipstream-server"; then
+            chmod +x "$BIN_DIR/slipstream-server"
+            success "Slipstream installed"
         else
-            echo -e "${C_RED}❌ Failed to download Slipstream binary${C_RESET}"
+            echo -e "${C_RED}❌ Failed to download Slipstream${C_RESET}"
             return 1
         fi
     else
@@ -247,14 +273,18 @@ install_binaries() {
     # ---- Set ownership ----
     chown -R voltrondns:voltrondns "$DB_DIR" 2>/dev/null || true
     
+    # ---- Create installation flag ----
+    touch "$INSTALL_FLAG"
+    
     # ---- Show summary ----
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}              ✅ ALL BINARIES INSTALLED!                     ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "  ${C_BOLD}microsocks:${C_RESET}      $(command -v microsocks 2>/dev/null || echo 'Not found')"
-    echo -e "  ${C_BOLD}gost:${C_RESET}            $(command -v gost 2>/dev/null || echo 'Not found')"
-    echo -e "  ${C_BOLD}dnstt-server:${C_RESET}    $(command -v dnstt-server 2>/dev/null || echo 'Not found')"
-    echo -e "  ${C_BOLD}slipstream-server:${C_RESET} $(command -v slipstream-server 2>/dev/null || echo 'Not found')"
+    echo -e "  ${C_BOLD}Architecture:${C_RESET}   ${C_YELLOW}$arch${C_RESET}"
+    echo -e "  ${C_BOLD}microsocks:${C_RESET}     ${C_GREEN}$(command -v microsocks 2>/dev/null || echo 'Not found')${C_RESET}"
+    echo -e "  ${C_BOLD}gost:${C_RESET}           ${C_GREEN}$(command -v gost 2>/dev/null || echo 'Not found')${C_RESET}"
+    echo -e "  ${C_BOLD}dnstt-server:${C_RESET}   ${C_GREEN}$(command -v dnstt-server 2>/dev/null || echo 'Not found')${C_RESET}"
+    echo -e "  ${C_BOLD}slipstream-server:${C_RESET} ${C_GREEN}$(command -v slipstream-server 2>/dev/null || echo 'Not found')${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     
     press_enter
@@ -422,8 +452,10 @@ add_tunnel() {
     done
     
     if ! command -v "$BINARY" &>/dev/null; then
-        error "$BINARY not installed. Run option [1] first."
-        return 1
+        error "$BINARY not installed. Installing binaries automatically..."
+        install_binaries
+        press_enter
+        return
     fi
     echo -e "${C_GREEN}✅ Transport: ${C_YELLOW}$TRANSPORT${C_RESET}\n"
     
@@ -1179,19 +1211,14 @@ add_ssh_user() {
     
     local p
     echo "Password (leave empty for auto-generated): "
-    while true; do
-        read -p "" p
-        if [[ -z "$p" ]]; then
-            p=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 12)
-            echo -e "${C_GREEN}🔑 Auto-generated password: ${C_YELLOW}$p${C_RESET}"
-            break
-        fi
-        if [[ ${#p} -lt 6 ]]; then
-            echo -e "${C_RED}❌ Password must be at least 6 characters.${C_RESET}"
-            continue
-        fi
-        break
-    done
+    read -r p
+    if [[ -z "$p" ]]; then
+        p=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 12)
+        echo -e "${C_GREEN}🔑 Auto-generated password: ${C_YELLOW}$p${C_RESET}"
+    elif [[ ${#p} -lt 6 ]]; then
+        echo -e "${C_RED}❌ Password must be at least 6 characters.${C_RESET}"
+        return 1
+    fi
     
     local days
     while true; do
@@ -1284,19 +1311,14 @@ add_socks5_user() {
     
     local p
     echo "Password (leave empty for auto-generated): "
-    while true; do
-        read -p "" p
-        if [[ -z "$p" ]]; then
-            p=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 12)
-            echo -e "${C_GREEN}🔑 Auto-generated password: ${C_YELLOW}$p${C_RESET}"
-            break
-        fi
-        if [[ ${#p} -lt 6 ]]; then
-            echo -e "${C_RED}❌ Password must be at least 6 characters.${C_RESET}"
-            continue
-        fi
-        break
-    done
+    read -r p
+    if [[ -z "$p" ]]; then
+        p=$(tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c 12)
+        echo -e "${C_GREEN}🔑 Auto-generated password: ${C_YELLOW}$p${C_RESET}"
+    elif [[ ${#p} -lt 6 ]]; then
+        echo -e "${C_RED}❌ Password must be at least 6 characters.${C_RESET}"
+        return 1
+    fi
     
     local days
     while true; do
@@ -2669,47 +2691,52 @@ main_menu() {
     while true; do
         clear
         echo -e "${C_PURPLE}╔═══════════════════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_PURPLE}║${C_BOLD}         🔥 VOLTRON GATE v7.2 (DNSTM STYLE) 🔥${C_RESET}${C_PURPLE}        ║${C_RESET}"
+        echo -e "${C_PURPLE}║${C_BOLD}         🔥 VOLTRON GATE v7.3 (DNSTM STYLE) 🔥${C_RESET}${C_PURPLE}        ║${C_RESET}"
         echo -e "${C_PURPLE}║${C_WHITE}    Bandwidth + Expiry + DNS Tunnel Manager${C_RESET}${C_PURPLE}          ║${C_RESET}"
         echo -e "${C_PURPLE}╚═══════════════════════════════════════════════════════════════╝${C_RESET}"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}📦 DNS TUNNEL MANAGEMENT${C_RESET}"
         echo -e "  ──────────────────────"
-        echo -e "  ${C_GREEN}[1]${C_RESET} Install All Binaries"
-        echo -e "  ${C_GREEN}[2]${C_RESET} Add New Tunnel (DNSTT or Slipstream)"
-        echo -e "  ${C_GREEN}[3]${C_RESET} List Tunnels"
-        echo -e "  ${C_GREEN}[4]${C_RESET} Delete Tunnel"
+        echo -e "  ${C_GREEN}[1]${C_RESET} Add New Tunnel (DNSTT or Slipstream)"
+        echo -e "  ${C_GREEN}[2]${C_RESET} List Tunnels"
+        echo -e "  ${C_GREEN}[3]${C_RESET} Delete Tunnel"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}👥 USER MANAGEMENT${C_RESET}"
         echo -e "  ──────────────"
-        echo -e "  ${C_GREEN}[5]${C_RESET} SSH User Manager"
-        echo -e "  ${C_GREEN}[6]${C_RESET} SOCKS5 User Manager"
-        echo -e "  ${C_GREEN}[7]${C_RESET} List All Users"
+        echo -e "  ${C_GREEN}[4]${C_RESET} SSH User Manager"
+        echo -e "  ${C_GREEN}[5]${C_RESET} SOCKS5 User Manager"
+        echo -e "  ${C_GREEN}[6]${C_RESET} List All Users"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}⚡ PERFORMANCE${C_RESET}"
         echo -e "  ────────────"
-        echo -e "  ${C_GREEN}[8]${C_RESET} Apply Super Speed Booster (DNSTT)"
-        echo -e "  ${C_GREEN}[9]${C_RESET} Setup Firewall"
-        echo -e "  ${C_GREEN}[A]${C_RESET} Install Limiter Service"
+        echo -e "  ${C_GREEN}[7]${C_RESET} Apply Super Speed Booster (DNSTT)"
+        echo -e "  ${C_GREEN}[8]${C_RESET} Setup Firewall"
+        echo -e "  ${C_GREEN}[9]${C_RESET} Install Limiter Service"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}ℹ️ INFO${C_RESET}"
         echo -e "  ────────────"
-        echo -e "  ${C_GREEN}[B]${C_RESET} System Info"
+        echo -e "  ${C_GREEN}[A]${C_RESET} System Info"
         echo ""
         
         echo -e "  ${C_RED}${C_BOLD}[0]${C_RESET} Exit"
         echo -e "  ${C_RED}${C_BOLD}[99]${C_RESET} Uninstall Voltron Gate"
         echo ""
         
+        # Check if binaries are installed
+        if [[ ! -f "$INSTALL_FLAG" ]] || ! command -v dnstt-server &>/dev/null || ! command -v slipstream-server &>/dev/null; then
+            echo -e "${C_YELLOW}⚠️ Binaries not found. Installing automatically...${C_RESET}"
+            install_binaries
+        fi
+        
         local opt
         while true; do
             read -p "👉 Select option: " opt
             case $opt in
-                1|2|3|4|5|6|7|8|9|A|a|B|b|0|99)
+                1|2|3|4|5|6|7|8|9|A|a|0|99)
                     break
                     ;;
                 *)
@@ -2721,17 +2748,16 @@ main_menu() {
         opt=$(echo "$opt" | tr '[:lower:]' '[:upper:]')
         
         case $opt in
-            1) install_binaries ;;
-            2) add_tunnel ;;
-            3) list_tunnels ;;
-            4) delete_tunnel ;;
-            5) ssh_user_menu ;;
-            6) socks5_user_menu ;;
-            7) list_users ;;
-            8) apply_speed_booster ;;
-            9) setup_firewall ;;
-            A) setup_limiter ;;
-            B) show_system_info ;;
+            1) add_tunnel ;;
+            2) list_tunnels ;;
+            3) delete_tunnel ;;
+            4) ssh_user_menu ;;
+            5) socks5_user_menu ;;
+            6) list_users ;;
+            7) apply_speed_booster ;;
+            8) setup_firewall ;;
+            9) setup_limiter ;;
+            A) show_system_info ;;
             0) 
                 echo -e "${C_GREEN}👋 Goodbye!${C_RESET}"
                 exit 0 
@@ -2762,6 +2788,11 @@ mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR
 touch $SSH_USERS_DB $SOCKS5_USERS_DB $TUNNELS_DB $MICROSOCKS_AUTH
 
 setup_command
+
+# Install binaries if not present
+if [[ ! -f "$INSTALL_FLAG" ]] || ! command -v dnstt-server &>/dev/null || ! command -v slipstream-server &>/dev/null; then
+    install_binaries
+fi
 
 if ! systemctl is-active --quiet microsocks-main 2>/dev/null; then
     start_microsocks
