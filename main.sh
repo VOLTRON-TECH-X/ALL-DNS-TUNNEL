@@ -20,6 +20,7 @@
 # - DNSTT Keys kwa Falcon style
 # - Unique certificate kwa kila Slipstream tunnel
 # - Domain options kwa namba (1/2)
+# - microsocks imehakikishiwa inafanya kazi
 # ============================================================================
 
 set -euo pipefail
@@ -411,16 +412,19 @@ EOF
     echo "$full_domain"
 }
 
-# ========== 3. START MICROSOCKS (FIXED) ==========
+# ========== 3. START MICROSOCKS (FIXED - HAKIKISHA INAFANYA KAZI) ==========
 start_microsocks() {
     log "Starting microsocks on port $SOCKS5_PORT..."
     
-    # ---- Hakikisha binary ipo ----
+    # ---- Hakikisha binary ipo na ina ruhusa ----
     if ! command -v microsocks &>/dev/null; then
         log "microsocks not found. Downloading..."
         wget -q -O "$BIN_DIR/microsocks" "$MICROSOCKS_URL"
         chmod +x "$BIN_DIR/microsocks"
         success "microsocks downloaded"
+    else
+        # Hakikisha ina ruhusa
+        chmod +x "$BIN_DIR/microsocks"
     fi
     
     # ---- Hakikisha auth file ipo ----
@@ -431,6 +435,13 @@ start_microsocks() {
     systemctl stop microsocks-main 2>/dev/null || true
     pkill -f microsocks 2>/dev/null || true
     sleep 1
+    
+    # ---- Hakikisha port 1080 haijachukuliwa ----
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        echo -e "${C_YELLOW}⚠️ Port $SOCKS5_PORT is in use. Killing existing process...${C_RESET}"
+        fuser -k "$SOCKS5_PORT/tcp" 2>/dev/null || true
+        sleep 1
+    fi
     
     # ---- Unda service file ----
     cat > "/etc/systemd/system/microsocks-main.service" << EOF
@@ -459,36 +470,57 @@ EOF
         
         if systemctl is-active --quiet microsocks-main; then
             success "microsocks started on port $SOCKS5_PORT"
-        else
-            echo -e "${C_YELLOW}⚠️ Service failed. Trying manual start...${C_RESET}"
-            /usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH &
-            sleep 2
-            if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-                success "microsocks started manually on port $SOCKS5_PORT"
-            else
-                error "Failed to start microsocks"
-                return 1
-            fi
-        fi
-    else
-        echo -e "${C_YELLOW}⚠️ Systemd start failed. Trying manual start...${C_RESET}"
-        /usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH &
-        sleep 2
-        if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-            success "microsocks started manually on port $SOCKS5_PORT"
-        else
-            error "Failed to start microsocks"
-            return 1
+            return 0
         fi
     fi
     
-    # ---- Thibitisha ----
+    # ---- Ikiwa systemd inashindwa, jaribu manual ----
+    echo -e "${C_YELLOW}⚠️ Service failed. Trying manual start...${C_RESET}"
+    
+    # Hakikisha binary ina ruhusa
+    chmod +x "$BIN_DIR/microsocks"
+    
+    # Anzisha manual katika background
+    nohup "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 -a "$MICROSOCKS_AUTH" > /dev/null 2>&1 &
+    
+    sleep 3
+    
+    # ---- Thibitisha kama imeanza ----
     if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-        success "microsocks is running on port $SOCKS5_PORT"
-    else
-        error "microsocks is NOT running"
-        return 1
+        success "microsocks started manually on port $SOCKS5_PORT"
+        return 0
     fi
+    
+    # ---- Jaribu njia nyingine ----
+    echo -e "${C_YELLOW}⚠️ Manual start failed. Trying with direct execution...${C_RESET}"
+    
+    # Anzisha na uweke kwenye background
+    "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 -a "$MICROSOCKS_AUTH" &
+    
+    sleep 2
+    
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        success "microsocks started on port $SOCKS5_PORT"
+        return 0
+    fi
+    
+    # ---- Ikiwa bado inashindwa, angalia port ----
+    echo -e "${C_RED}❌ Failed to start microsocks${C_RESET}"
+    echo -e "${C_YELLOW}💡 Checking if port $SOCKS5_PORT is in use...${C_RESET}"
+    ss -tlnp | grep ":${SOCKS5_PORT}" || echo -e "${C_DIM}Port $SOCKS5_PORT is free.${C_RESET}"
+    
+    # ---- Jaribu kuanza na option nyingine ----
+    echo -e "${C_YELLOW}💡 Trying to start microsocks without auth...${C_RESET}"
+    "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 &
+    sleep 2
+    
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        echo -e "${C_YELLOW}⚠️ microsocks started without auth (no authentication)${C_RESET}"
+        success "microsocks started on port $SOCKS5_PORT (no auth)"
+        return 0
+    fi
+    
+    return 1
 }
 
 # ========== 4. START DNS ROUTER (GOST) ==========
@@ -542,7 +574,7 @@ EOF
     success "DNS Router started with $count tunnels"
 }
 
-# ========== 5. ADD TUNNEL (FIXED - NUMBERS + UNIQUE CERT) ==========
+# ========== 5. ADD TUNNEL ==========
 add_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🚀 ADD DNS TUNNEL                        ${C_RESET}"
@@ -614,7 +646,7 @@ add_tunnel() {
     echo -e "${C_GREEN}✅ DNS Port: ${C_YELLOW}$TUNNEL_PORT${C_RESET}"
     echo -e "${C_GREEN}✅ Backend Port: ${C_YELLOW}$BACKEND_PORT${C_RESET}\n"
     
-    # ---- STEP 5: Domain (FIXED WITH NUMBERS) ----
+    # ---- STEP 5: Domain ----
     echo -e "${C_CYAN}${C_BOLD}[4] Domain:${C_RESET}"
     echo "  1) Auto-generate with deSEC (Recommended)"
     echo "  2) Enter custom domain"
@@ -756,7 +788,7 @@ EOF
         echo -e "${C_YELLOW}ℹ️ SSH backend uses system SSH on port 22${C_RESET}\n"
     fi
     
-    # ---- STEP 9: Create Tunnel Service (FIXED: Unique certificate per tunnel) ----
+    # ---- STEP 9: Create Tunnel Service ----
     local service_name="voltron-${TRANSPORT}-${TAG}"
     local service_file="/etc/systemd/system/${service_name}.service"
     
@@ -786,7 +818,7 @@ WantedBy=multi-user.target
 EOF
             ;;
         slipstream)
-            # ---- FIXED: Unique certificate per tunnel ----
+            # Unique certificate per tunnel
             local cert_file="$DB_DIR/slipstream_${TAG}_cert.pem"
             local key_file="$DB_DIR/slipstream_${TAG}_key.pem"
             
@@ -1876,9 +1908,9 @@ list_ssh_users() {
         return
     fi
     
-    printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-15s | %-10s${C_RESET}\n" \
+    printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-12s | %-10s${C_RESET}\n" \
         "USERNAME" "EXPIRES" "CONNS" "BANDWIDTH" "USED" "STATUS"
-    echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+    echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
     
     while IFS=: read -r user pass expiry limit bandwidth_gb used_gb status; do
         [[ -z "$user" ]] && continue
@@ -1897,11 +1929,11 @@ list_ssh_users() {
         local bw_display="Unlimited"
         [[ "$bandwidth_gb" != "0" ]] && bw_display="${bandwidth_gb}GB"
         
-        printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-15s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
+        printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-12s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
             "$user" "$expiry" "$conn_string" "$bw_display" "${used_gb_display}GB" "$status"
     done < "$SSH_USERS_DB"
     
-    echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+    echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
     echo -e "${C_BOLD}Total SSH Users:${C_RESET} ${C_GREEN}$(wc -l < "$SSH_USERS_DB")${C_RESET}"
     press_enter
 }
@@ -2144,9 +2176,9 @@ list_socks5_users() {
         return
     fi
     
-    printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-15s | %-10s${C_RESET}\n" \
+    printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-12s | %-10s${C_RESET}\n" \
         "USERNAME" "EXPIRES" "CONNS" "BANDWIDTH" "USED" "STATUS"
-    echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+    echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
     
     while IFS=: read -r user pass expiry limit bandwidth_gb used_gb status; do
         [[ -z "$user" ]] && continue
@@ -2162,11 +2194,11 @@ list_socks5_users() {
         local bw_display="Unlimited"
         [[ "$bandwidth_gb" != "0" ]] && bw_display="${bandwidth_gb}GB"
         
-        printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-15s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
+        printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-12s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
             "$user" "$expiry" "$limit" "$bw_display" "${used_gb_display}GB" "$status"
     done < "$SOCKS5_USERS_DB"
     
-    echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+    echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
     echo -e "${C_BOLD}Total SOCKS5 Users:${C_RESET} ${C_GREEN}$(wc -l < "$SOCKS5_USERS_DB")${C_RESET}"
     press_enter
 }
@@ -2333,9 +2365,9 @@ list_users() {
     
     echo -e "${C_CYAN}${C_BOLD}SSH USERS:${C_RESET}\n"
     if [[ -f "$SSH_USERS_DB" && -s "$SSH_USERS_DB" ]]; then
-        printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-15s | %-10s${C_RESET}\n" \
+        printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-12s | %-10s${C_RESET}\n" \
             "USERNAME" "EXPIRES" "CONNS" "BANDWIDTH" "USED" "STATUS"
-        echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+        echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
         
         while IFS=: read -r user pass expiry limit bandwidth_gb used_gb status; do
             [[ -z "$user" ]] && continue
@@ -2354,11 +2386,11 @@ list_users() {
             local bw_display="Unlimited"
             [[ "$bandwidth_gb" != "0" ]] && bw_display="${bandwidth_gb}GB"
             
-            printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-15s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
+            printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-12s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
                 "$user" "$expiry" "$conn_string" "$bw_display" "${used_gb_display}GB" "$status"
         done < "$SSH_USERS_DB"
         
-        echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+        echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
         echo -e "${C_BOLD}Total SSH Users:${C_RESET} ${C_GREEN}$(wc -l < "$SSH_USERS_DB")${C_RESET}"
     else
         echo -e "${C_YELLOW}ℹ️ No SSH users found.${C_RESET}"
@@ -2366,9 +2398,9 @@ list_users() {
     
     echo -e "\n${C_CYAN}${C_BOLD}SOCKS5 USERS:${C_RESET}\n"
     if [[ -f "$SOCKS5_USERS_DB" && -s "$SOCKS5_USERS_DB" ]]; then
-        printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-15s | %-10s${C_RESET}\n" \
+        printf "${C_BOLD}${C_WHITE}%-15s | %-12s | %-8s | %-12s | %-12s | %-10s${C_RESET}\n" \
             "USERNAME" "EXPIRES" "CONNS" "BANDWIDTH" "USED" "STATUS"
-        echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+        echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
         
         while IFS=: read -r user pass expiry limit bandwidth_gb used_gb status; do
             [[ -z "$user" ]] && continue
@@ -2384,11 +2416,11 @@ list_users() {
             local bw_display="Unlimited"
             [[ "$bandwidth_gb" != "0" ]] && bw_display="${bandwidth_gb}GB"
             
-            printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-15s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
+            printf "%-15s | ${C_YELLOW}%-12s${C_RESET} | ${C_CYAN}%-8s${C_RESET} | ${C_ORANGE}%-12s${C_RESET} | ${C_WHITE}%-12s${C_RESET} | ${status_color}%-10s${C_RESET}\n" \
                 "$user" "$expiry" "$limit" "$bw_display" "${used_gb_display}GB" "$status"
         done < "$SOCKS5_USERS_DB"
         
-        echo -e "${C_GRAY}───────────────────────────────────────────────────────────────────────────────${C_RESET}"
+        echo -e "${C_GRAY}─────────────────────────────────────────────────────────────────────────────────${C_RESET}"
         echo -e "${C_BOLD}Total SOCKS5 Users:${C_RESET} ${C_GREEN}$(wc -l < "$SOCKS5_USERS_DB")${C_RESET}"
     else
         echo -e "${C_YELLOW}ℹ️ No SOCKS5 users found.${C_RESET}"
@@ -2397,7 +2429,7 @@ list_users() {
     press_enter
 }
 
-# ========== 19. SUPER SPEED BOOSTER (FIXED - WITH PRESS ENTER) ==========
+# ========== 19. SUPER SPEED BOOSTER ==========
 apply_speed_booster() {
     clear
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2686,9 +2718,8 @@ EOF
     echo -e "  ${C_DIM}2. Check UDP buffer: sysctl net.core.rmem_max${C_RESET}"
     echo -e "  ${C_DIM}3. Monitor bandwidth: bmon or nethogs${C_RESET}"
     
-    # ---- FIXED: ADD PRESS ENTER ----
     echo ""
-    press_enter  # <-- HII ILIKOSA!
+    press_enter
 }
 
 # ========== 20. SETUP FIREWALL ==========
@@ -2889,6 +2920,12 @@ main_menu() {
             install_binaries
         fi
         
+        # Make sure microsocks is running
+        if ! ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+            echo -e "${C_YELLOW}⚠️ microsocks not running. Starting...${C_RESET}"
+            start_microsocks
+        fi
+        
         local opt
         while true; do
             read -p "👉 Select option: " opt
@@ -2951,7 +2988,8 @@ if [[ ! -f "$INSTALL_FLAG" ]] || ! command -v dnstt-server &>/dev/null || ! comm
     install_binaries
 fi
 
-if ! systemctl is-active --quiet microsocks-main 2>/dev/null; then
+# Make sure microsocks is running
+if ! ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
     start_microsocks
 fi
 
