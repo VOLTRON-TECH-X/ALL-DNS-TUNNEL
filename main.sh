@@ -25,6 +25,7 @@ SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SO
 # ========== COLORS ==========
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
+C_DIM='\033[2m'
 C_RED='\033[38;5;196m'
 C_GREEN='\033[38;5;46m'
 C_YELLOW='\033[38;5;226m'
@@ -135,16 +136,40 @@ find_unique_port() {
     done
 }
 
-# ========== 1. INSTALL BINARIES ==========
+# ========== 1. INSTALL BINARIES (IMPROVED) ==========
 install_binaries() {
     log "📥 Installing DNS tunnel binaries..."
     
-    apt update && apt install -y curl wget bc iptables net-tools unzip build-essential git openssl
+    # ---- Check and install dependencies ----
+    echo -e "${C_BLUE}🔧 Checking dependencies...${C_RESET}"
+    local deps=("curl" "wget" "git" "make" "gcc" "openssl" "build-essential")
+    local missing=()
     
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${C_YELLOW}⚠️ Installing missing dependencies: ${missing[*]}${C_RESET}"
+        apt update && apt install -y "${missing[@]}"
+    fi
+    
+    # ---- Create user ----
     if ! id "voltrondns" &>/dev/null; then
         useradd -r -s /usr/sbin/nologin voltrondns
     fi
     
+    # ---- Backup existing binaries ----
+    echo -e "${C_BLUE}💾 Backing up existing binaries...${C_RESET}"
+    for bin in microsocks gost dnstt-server slipstream-server; do
+        if [[ -f "$BIN_DIR/$bin" ]]; then
+            cp "$BIN_DIR/$bin" "$BIN_DIR/${bin}.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+        fi
+    done
+    
+    # ---- 1.1 microsocks ----
     log "Installing microsocks..."
     if ! command -v microsocks &>/dev/null; then
         cd /tmp
@@ -153,46 +178,85 @@ install_binaries() {
         make && make install
         cd /tmp && rm -rf microsocks
         success "microsocks installed"
+    else
+        success "microsocks already installed"
     fi
     
+    # ---- 1.2 GOST DNS Router ----
     log "Installing GOST DNS Router..."
     if ! command -v gost &>/dev/null; then
         local gost_version="2.11.5"
         local arch="linux_amd64"
         [[ $(uname -m) == "aarch64" ]] && arch="linux_arm64"
         
-        wget -q "https://github.com/ginuerzh/gost/releases/download/v${gost_version}/gost-${gost_version}-${arch}.tar.gz" -O /tmp/gost.tar.gz
-        tar -xzf /tmp/gost.tar.gz -C /tmp
-        cp "/tmp/gost_${gost_version}_linux_amd64/gost" "$BIN_DIR/gost" 2>/dev/null || \
-        cp "/tmp/gost" "$BIN_DIR/gost" 2>/dev/null || true
-        chmod +x "$BIN_DIR/gost"
-        rm -rf /tmp/gost*
-        success "GOST installed"
+        if wget -q "https://github.com/ginuerzh/gost/releases/download/v${gost_version}/gost-${gost_version}-${arch}.tar.gz" -O /tmp/gost.tar.gz; then
+            tar -xzf /tmp/gost.tar.gz -C /tmp
+            cp "/tmp/gost_${gost_version}_linux_amd64/gost" "$BIN_DIR/gost" 2>/dev/null || \
+            cp "/tmp/gost" "$BIN_DIR/gost" 2>/dev/null || true
+            chmod +x "$BIN_DIR/gost"
+            rm -rf /tmp/gost*
+            success "GOST installed: v${gost_version}"
+        else
+            echo -e "${C_RED}❌ Failed to download GOST${C_RESET}"
+            return 1
+        fi
+    else
+        success "GOST already installed"
     fi
     
+    # ---- 1.3 DNSTT Server ----
     log "Installing DNSTT server..."
     if ! command -v dnstt-server &>/dev/null; then
         cd /tmp
-        git clone https://www.bamsoftware.com/git/dnstt.git 2>/dev/null || true
-        cd dnstt
-        make
-        cp dnstt-server "$BIN_DIR/"
-        cp dnstt-client "$BIN_DIR/"
-        cd /tmp && rm -rf dnstt
-        success "DNSTT installed"
+        if git clone https://www.bamsoftware.com/git/dnstt.git 2>/dev/null; then
+            cd dnstt
+            if make; then
+                cp dnstt-server "$BIN_DIR/"
+                cp dnstt-client "$BIN_DIR/"
+                success "DNSTT installed successfully"
+            else
+                echo -e "${C_RED}❌ Failed to compile DNSTT${C_RESET}"
+                cd /tmp && rm -rf dnstt
+                return 1
+            fi
+            cd /tmp && rm -rf dnstt
+        else
+            echo -e "${C_RED}❌ Failed to clone DNSTT repository${C_RESET}"
+            return 1
+        fi
+    else
+        success "DNSTT already installed"
     fi
     
+    # ---- 1.4 Slipstream Server ----
     log "Installing Slipstream server..."
     if ! command -v slipstream-server &>/dev/null; then
         cd /tmp
-        wget -q https://github.com/anonvector/slipstream/releases/latest/download/slipstream-server -O slipstream-server
-        chmod +x slipstream-server
-        mv slipstream-server "$BIN_DIR/"
-        success "Slipstream installed"
+        if wget -q https://github.com/anonvector/slipstream/releases/latest/download/slipstream-server -O slipstream-server; then
+            chmod +x slipstream-server
+            mv slipstream-server "$BIN_DIR/"
+            success "Slipstream installed successfully"
+        else
+            echo -e "${C_RED}❌ Failed to download Slipstream binary${C_RESET}"
+            return 1
+        fi
+    else
+        success "Slipstream already installed"
     fi
     
+    # ---- Set ownership ----
     chown -R voltrondns:voltrondns "$DB_DIR" 2>/dev/null || true
-    success "All binaries installed successfully!"
+    
+    # ---- Show summary ----
+    echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_GREEN}${C_BOLD}              ✅ ALL BINARIES INSTALLED!                     ${C_RESET}"
+    echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "  ${C_BOLD}microsocks:${C_RESET}      $(command -v microsocks 2>/dev/null || echo 'Not found')"
+    echo -e "  ${C_BOLD}gost:${C_RESET}            $(command -v gost 2>/dev/null || echo 'Not found')"
+    echo -e "  ${C_BOLD}dnstt-server:${C_RESET}    $(command -v dnstt-server 2>/dev/null || echo 'Not found')"
+    echo -e "  ${C_BOLD}slipstream-server:${C_RESET} $(command -v slipstream-server 2>/dev/null || echo 'Not found')"
+    echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    
     press_enter
 }
 
@@ -625,7 +689,7 @@ EOF
     press_enter
 }
 
-# ========== 6. LIST TUNNELS (IMPROVED) ==========
+# ========== 6. LIST TUNNELS ==========
 list_tunnels() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    📡 ACTIVE TUNNELS                         ${C_RESET}"
