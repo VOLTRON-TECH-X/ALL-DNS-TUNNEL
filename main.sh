@@ -17,6 +17,9 @@
 # - List Tunnels kwa mtindo wa namba
 # - Auto-install binaries (hakuna option [1])
 # - GOST v2.12.0 (latest)
+# - DNSTT Keys kwa Falcon style
+# - Unique certificate kwa kila Slipstream tunnel
+# - Domain options kwa namba (1/2)
 # ============================================================================
 
 set -euo pipefail
@@ -74,7 +77,7 @@ BACKEND_PORT_START=30000
 # microsocks (SOCKS5)
 MICROSOCKS_URL="https://github.com/rofl0r/microsocks/releases/latest/download/microsocks"
 
-# GOST DNS Router v2.12.0 (NEW!)
+# GOST DNS Router v2.12.0
 GOST_URL_X86="https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_amd64.tar.gz"
 GOST_URL_ARM="https://github.com/ginuerzh/gost/releases/download/v2.12.0/gost_2.12.0_linux_arm64.tar.gz"
 
@@ -89,7 +92,7 @@ SLIPSTREAM_URL_X86="https://github.com/anonvector/slipgate/releases/latest/downl
 SLIPSTREAM_URL_ARM="https://github.com/anonvector/slipgate/releases/latest/download/slipstream-server-linux-arm64"
 
 # ========== CREATE DIRECTORIES ==========
-mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR
+mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR $DB_DIR/keys
 touch $SSH_USERS_DB $SOCKS5_USERS_DB $TUNNELS_DB $MICROSOCKS_AUTH
 
 # ========== HELPER FUNCTIONS ==========
@@ -220,13 +223,11 @@ install_binaries() {
         if wget -q --show-progress "$GOST_URL" -O /tmp/gost.tar.gz; then
             tar -xzf /tmp/gost.tar.gz -C /tmp
             
-            # Tafuta binary ya gost
             if [[ -f "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" ]]; then
                 cp "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" "$BIN_DIR/gost"
             elif [[ -f "/tmp/gost" ]]; then
                 cp "/tmp/gost" "$BIN_DIR/gost"
             else
-                # Jaribu kutafuta binary yoyote
                 find /tmp -name "gost" -type f -executable | head -1 | xargs -I {} cp {} "$BIN_DIR/gost"
             fi
             
@@ -310,11 +311,14 @@ install_binaries() {
     press_enter
 }
 
-# ========== 2. GENERATE DESEC DOMAIN ==========
+# ========== 2. GENERATE DESEC DOMAIN (FIXED - FALCON STYLE) ==========
 gen_desec_domain() {
     local transport=$1
     local backend=$2
-    local rand=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 6)
+    local rand=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)
+    
+    local ip=$(get_ip)
+    is_valid_ipv4 "$ip" || { error "Invalid IP: $ip"; return 1; }
     
     local prefix=""
     case $transport in
@@ -330,52 +334,105 @@ gen_desec_domain() {
         *) backend_suffix="tun" ;;
     esac
     
-    local ns="${prefix}-ns-${rand}"
-    local tun="${prefix}-${backend_suffix}-${rand}"
-    local ip=$(get_ip)
-    
-    is_valid_ipv4 "$ip" || { error "Invalid IP: $ip"; return 1; }
+    local ns_sub="${prefix}-ns-${rand}"
+    local tun_sub="${prefix}-${backend_suffix}-${rand}"
     
     log "Creating DNS records for ${C_YELLOW}${transport}${C_RESET} tunnel..."
-    echo -e "  ${C_DIM}NS Record:${C_RESET} ${ns}.${DESEC_DOMAIN}"
-    echo -e "  ${C_DIM}Tunnel:${C_RESET}    ${tun}.${DESEC_DOMAIN}"
+    echo -e "  ${C_DIM}NS Subdomain:${C_RESET} ${ns_sub}.${DESEC_DOMAIN}"
+    echo -e "  ${C_DIM}Tunnel Subdomain:${C_RESET} ${tun_sub}.${DESEC_DOMAIN}"
+    echo -e "  ${C_DIM}Server IP:${C_RESET} ${ip}"
+    
+    # ---- Test deSEC API connection ----
+    local test_response=$(curl -s -o /dev/null -w "%{http_code}" -X GET "https://desec.io/api/v1/domains" \
+        -H "Authorization: Token $DESEC_TOKEN" 2>/dev/null)
+    
+    if [[ "$test_response" == "401" ]] || [[ "$test_response" == "403" ]]; then
+        error "Invalid deSEC token. Please check your credentials."
+        return 1
+    fi
+    
+    # ---- Create A record ----
+    local api_data_a=$(cat <<EOF
+[{
+    "subname": "$ns_sub",
+    "type": "A",
+    "ttl": 60,
+    "records": ["$ip"]
+}]
+EOF
+)
     
     local response=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
         -H "Authorization: Token $DESEC_TOKEN" \
         -H "Content-Type: application/json" \
-        --data "[{\"subname\":\"$ns\",\"type\":\"A\",\"ttl\":60,\"records\":[\"$ip\"]}]")
+        --data "$api_data_a")
     
     local http_code=${response: -3}
     if [[ $http_code -ne 201 && $http_code -ne 200 ]]; then
         error "Failed to create A record (HTTP $http_code)"
         return 1
     fi
-    echo -e "  ${C_GREEN}✅ A record created${C_RESET}"
+    echo -e "  ${C_GREEN}✅ A record created: ${ns_sub}.${DESEC_DOMAIN} -> $ip${C_RESET}"
+    
+    # ---- Create NS record ----
+    local api_data_ns=$(cat <<EOF
+[{
+    "subname": "$tun_sub",
+    "type": "NS",
+    "ttl": 60,
+    "records": ["${ns_sub}.${DESEC_DOMAIN}."]
+}]
+EOF
+)
     
     response=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
         -H "Authorization: Token $DESEC_TOKEN" \
         -H "Content-Type: application/json" \
-        --data "[{\"subname\":\"$tun\",\"type\":\"NS\",\"ttl\":60,\"records\":[\"${ns}.${DESEC_DOMAIN}.\"]}]")
+        --data "$api_data_ns")
     
     http_code=${response: -3}
     if [[ $http_code -ne 201 && $http_code -ne 200 ]]; then
         error "Failed to create NS record (HTTP $http_code)"
-        curl -s -X DELETE "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/$ns/A/" \
+        curl -s -X DELETE "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/${ns_sub}/A/" \
             -H "Authorization: Token $DESEC_TOKEN" >/dev/null 2>&1
         return 1
     fi
-    echo -e "  ${C_GREEN}✅ NS record created${C_RESET}"
+    echo -e "  ${C_GREEN}✅ NS record created: ${tun_sub}.${DESEC_DOMAIN} -> ${ns_sub}.${DESEC_DOMAIN}${C_RESET}"
     
-    local full_domain="${tun}.${DESEC_DOMAIN}"
+    # ---- Return full domain ----
+    local full_domain="${tun_sub}.${DESEC_DOMAIN}"
     echo -e "  ${C_GREEN}✅ Tunnel domain: ${C_YELLOW}${full_domain}${C_RESET}"
+    
+    # Save domain info for cleanup
+    echo "NS_SUB=$ns_sub" > "$DB_DIR/dns_info.conf"
+    echo "TUN_SUB=$tun_sub" >> "$DB_DIR/dns_info.conf"
+    echo "FULL_DOMAIN=$full_domain" >> "$DB_DIR/dns_info.conf"
     
     echo "$full_domain"
 }
 
-# ========== 3. START MICROSOCKS ==========
+# ========== 3. START MICROSOCKS (FIXED) ==========
 start_microsocks() {
     log "Starting microsocks on port $SOCKS5_PORT..."
     
+    # ---- Hakikisha binary ipo ----
+    if ! command -v microsocks &>/dev/null; then
+        log "microsocks not found. Downloading..."
+        wget -q -O "$BIN_DIR/microsocks" "$MICROSOCKS_URL"
+        chmod +x "$BIN_DIR/microsocks"
+        success "microsocks downloaded"
+    fi
+    
+    # ---- Hakikisha auth file ipo ----
+    touch "$MICROSOCKS_AUTH"
+    chmod 644 "$MICROSOCKS_AUTH"
+    
+    # ---- Stop existing service ----
+    systemctl stop microsocks-main 2>/dev/null || true
+    pkill -f microsocks 2>/dev/null || true
+    sleep 1
+    
+    # ---- Unda service file ----
     cat > "/etc/systemd/system/microsocks-main.service" << EOF
 [Unit]
 Description=MicroSocks SOCKS5 Proxy (Main)
@@ -383,19 +440,55 @@ After=network.target
 
 [Service]
 Type=simple
-User=voltrondns
+User=root
 ExecStart=/usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=255
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable microsocks-main
-    systemctl restart microsocks-main
-    success "microsocks started on port $SOCKS5_PORT"
+    
+    # ---- Anzisha service ----
+    if systemctl start microsocks-main 2>/dev/null; then
+        systemctl enable microsocks-main 2>/dev/null || true
+        sleep 2
+        
+        if systemctl is-active --quiet microsocks-main; then
+            success "microsocks started on port $SOCKS5_PORT"
+        else
+            echo -e "${C_YELLOW}⚠️ Service failed. Trying manual start...${C_RESET}"
+            /usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH &
+            sleep 2
+            if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+                success "microsocks started manually on port $SOCKS5_PORT"
+            else
+                error "Failed to start microsocks"
+                return 1
+            fi
+        fi
+    else
+        echo -e "${C_YELLOW}⚠️ Systemd start failed. Trying manual start...${C_RESET}"
+        /usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH &
+        sleep 2
+        if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+            success "microsocks started manually on port $SOCKS5_PORT"
+        else
+            error "Failed to start microsocks"
+            return 1
+        fi
+    fi
+    
+    # ---- Thibitisha ----
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        success "microsocks is running on port $SOCKS5_PORT"
+    else
+        error "microsocks is NOT running"
+        return 1
+    fi
 }
 
 # ========== 4. START DNS ROUTER (GOST) ==========
@@ -449,7 +542,7 @@ EOF
     success "DNS Router started with $count tunnels"
 }
 
-# ========== 5. ADD TUNNEL ==========
+# ========== 5. ADD TUNNEL (FIXED - NUMBERS + UNIQUE CERT) ==========
 add_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🚀 ADD DNS TUNNEL                        ${C_RESET}"
@@ -498,7 +591,7 @@ add_tunnel() {
     
     # ---- STEP 3: Tunnel Tag ----
     echo -e "${C_CYAN}${C_BOLD}[3] Tunnel Tag:${C_RESET}"
-    echo -e "${C_DIM}Enter a descriptive name for this tunnel (e.g., 'brave-path', 'frost-link')${C_RESET}"
+    echo -e "${C_DIM}Enter a descriptive name for this tunnel${C_RESET}"
     echo ""
     
     read -p "Tunnel Tag: " TAG
@@ -521,38 +614,40 @@ add_tunnel() {
     echo -e "${C_GREEN}✅ DNS Port: ${C_YELLOW}$TUNNEL_PORT${C_RESET}"
     echo -e "${C_GREEN}✅ Backend Port: ${C_YELLOW}$BACKEND_PORT${C_RESET}\n"
     
-    # ---- STEP 5: Domain ----
+    # ---- STEP 5: Domain (FIXED WITH NUMBERS) ----
     echo -e "${C_CYAN}${C_BOLD}[4] Domain:${C_RESET}"
-    echo "  a) Auto-generate with deSEC (Recommended)"
-    echo "  b) Enter custom domain"
+    echo "  1) Auto-generate with deSEC (Recommended)"
+    echo "  2) Enter custom domain"
     echo ""
     
     local d_choice
     while true; do
-        read -p "Choice [a/b]: " d_choice
+        read -p "Choice [1-2]: " d_choice
         case $d_choice in
-            a|A)
+            1)
                 DOMAIN=$(gen_desec_domain "$TRANSPORT" "$BACKEND")
                 if [[ -z "$DOMAIN" ]]; then
-                    error "Failed to generate domain"
-                    return 1
+                    echo -e "${C_YELLOW}⚠️ Auto-generation failed. Please try again or use custom domain.${C_RESET}"
+                    continue
                 fi
                 break
                 ;;
-            b|B)
+            2)
                 read -p "Enter custom domain: " custom_domain
                 if [[ -z "$custom_domain" ]]; then
-                    error "Domain cannot be empty"
+                    echo -e "${C_RED}❌ Domain cannot be empty${C_RESET}"
                     continue
                 fi
                 if grep -q ":$custom_domain:" "$TUNNELS_DB" 2>/dev/null; then
-                    error "Domain $custom_domain is already in use"
+                    echo -e "${C_RED}❌ Domain $custom_domain is already in use${C_RESET}"
                     continue
                 fi
                 DOMAIN="$custom_domain"
                 break
                 ;;
-            *) echo -e "${C_RED}❌ Invalid choice${C_RESET}" ;;
+            *)
+                echo -e "${C_RED}❌ Invalid choice. Please enter 1 or 2.${C_RESET}"
+                ;;
         esac
     done
     echo -e "${C_GREEN}✅ Domain: ${C_YELLOW}$DOMAIN${C_RESET}\n"
@@ -605,16 +700,29 @@ add_tunnel() {
         echo -e "${C_GREEN}✅ Slipstream uses Adaptive MTU (auto-optimized)${C_RESET}\n"
     fi
     
-    # ---- STEP 7: Generate Key (ONLY FOR DNSTT) ----
+    # ---- STEP 7: Generate Keys (FALCON STYLE - ONLY FOR DNSTT) ----
     local KEY=""
     local PUBLIC_KEY=""
     if [[ "$TRANSPORT" == "dnstt" ]]; then
-        echo -e "${C_CYAN}${C_BOLD}[6] Generating Server Key...${C_RESET}"
-        KEY=$(openssl rand -base64 32 | tr -d '=' | head -c 32)
-        echo "$KEY" > "$DB_DIR/${TRANSPORT}_${DOMAIN}.key"
-        chmod 600 "$DB_DIR/${TRANSPORT}_${DOMAIN}.key"
-        PUBLIC_KEY="${KEY}"
-        echo -e "${C_GREEN}✅ Server key generated${C_RESET}\n"
+        echo -e "${C_CYAN}${C_BOLD}[6] Generating DNSTT Keys (Falcon style)...${C_RESET}"
+        
+        local key_dir="$DB_DIR/keys"
+        mkdir -p "$key_dir"
+        
+        "$BIN_DIR/dnstt-server" -gen-key \
+            -privkey-file "$key_dir/${DOMAIN}.key" \
+            -pubkey-file "$key_dir/${DOMAIN}.pub" 2>/dev/null
+        
+        if [[ -f "$key_dir/${DOMAIN}.key" ]] && [[ -f "$key_dir/${DOMAIN}.pub" ]]; then
+            KEY=$(cat "$key_dir/${DOMAIN}.key")
+            PUBLIC_KEY=$(cat "$key_dir/${DOMAIN}.pub")
+            success "DNSTT keys generated successfully"
+            echo -e "  ${C_BOLD}Public Key:${C_RESET} ${C_YELLOW}$PUBLIC_KEY${C_RESET}"
+        else
+            error "Failed to generate DNSTT keys"
+            return 1
+        fi
+        echo ""
     fi
     
     # ---- STEP 8: Start Backend Service (SOCKS5 only) ----
@@ -631,7 +739,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=voltrondns
+User=root
 ExecStart=/usr/local/bin/microsocks -p $BACKEND_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH
 Restart=always
 RestartSec=10
@@ -648,7 +756,7 @@ EOF
         echo -e "${C_YELLOW}ℹ️ SSH backend uses system SSH on port 22${C_RESET}\n"
     fi
     
-    # ---- STEP 9: Create Tunnel Service ----
+    # ---- STEP 9: Create Tunnel Service (FIXED: Unique certificate per tunnel) ----
     local service_name="voltron-${TRANSPORT}-${TAG}"
     local service_file="/etc/systemd/system/${service_name}.service"
     
@@ -668,8 +776,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=voltrondns
-ExecStart=$BINARY -udp :$TUNNEL_PORT -mtu $MTU -privkey-file $DB_DIR/${TRANSPORT}_${DOMAIN}.key $DOMAIN $backend_addr
+User=root
+ExecStart=$BINARY -udp :$TUNNEL_PORT -mtu $MTU -privkey-file $DB_DIR/keys/${DOMAIN}.key $DOMAIN $backend_addr
 Restart=always
 RestartSec=10
 
@@ -678,13 +786,18 @@ WantedBy=multi-user.target
 EOF
             ;;
         slipstream)
-            if [[ ! -f "$DB_DIR/slipstream_cert.pem" ]]; then
+            # ---- FIXED: Unique certificate per tunnel ----
+            local cert_file="$DB_DIR/slipstream_${TAG}_cert.pem"
+            local key_file="$DB_DIR/slipstream_${TAG}_key.pem"
+            
+            if [[ ! -f "$cert_file" ]]; then
                 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-                    -keyout "$DB_DIR/slipstream_key.pem" \
-                    -out "$DB_DIR/slipstream_cert.pem" \
+                    -keyout "$key_file" \
+                    -out "$cert_file" \
                     -subj "/CN=$DOMAIN" 2>/dev/null
-                chmod 600 "$DB_DIR/slipstream_key.pem"
-                chmod 644 "$DB_DIR/slipstream_cert.pem"
+                chmod 600 "$key_file"
+                chmod 644 "$cert_file"
+                echo -e "  ${C_GREEN}✅ Certificate generated for $TAG${C_RESET}"
             fi
             
             cat > "$service_file" << EOF
@@ -694,8 +807,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=voltrondns
-ExecStart=$BINARY -domain $DOMAIN -target $backend_addr -listen :$TUNNEL_PORT -cert $DB_DIR/slipstream_cert.pem -key $DB_DIR/slipstream_key.pem
+User=root
+ExecStart=$BINARY -domain $DOMAIN -target $backend_addr -listen :$TUNNEL_PORT -cert $cert_file -key $key_file
 Restart=always
 RestartSec=10
 
@@ -706,7 +819,7 @@ EOF
     esac
     
     # Save tunnel info
-    echo "$TRANSPORT:$DOMAIN:$BACKEND:$BACKEND_PORT:$TAG:$KEY:$TUNNEL_PORT:$MTU" >> "$TUNNELS_DB"
+    echo "$TRANSPORT:$DOMAIN:$BACKEND:$BACKEND_PORT:$TAG:$KEY:$TUNNEL_PORT:$MTU:$PUBLIC_KEY" >> "$TUNNELS_DB"
     
     systemctl daemon-reload
     systemctl enable "$service_name"
@@ -732,8 +845,8 @@ EOF
     else
         echo -e "  ${C_BOLD}MTU:${C_RESET}           ${C_GREEN}Adaptive (auto-optimized)${C_RESET}"
     fi
-    if [[ -n "$KEY" ]]; then
-        echo -e "  ${C_BOLD}Server Key:${C_RESET}   ${C_ORANGE}$KEY${C_RESET}"
+    if [[ -n "$PUBLIC_KEY" ]]; then
+        echo -e "  ${C_BOLD}Public Key:${C_RESET}   ${C_ORANGE}$PUBLIC_KEY${C_RESET}"
     fi
     echo -e "  ${C_BOLD}Status:${C_RESET}        ${C_GREEN}$(systemctl is-active "$service_name")${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -758,7 +871,7 @@ list_tunnels() {
     
     echo -e "${C_BOLD}${C_WHITE}Available Tunnels:${C_RESET}\n"
     
-    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
         [[ -z "$transport" ]] && continue
         count=$((count + 1))
         
@@ -784,7 +897,7 @@ list_tunnels() {
         
         echo -e "  ${C_GREEN}[$count]${C_RESET} ${C_YELLOW}$tag${C_RESET} ${C_DIM}(${transport_display} + ${backend_display})${C_RESET} ${status_icon}"
         
-        tunnel_info["$count"]="$transport:$domain:$backend:$backend_port:$tag:$key:$tunnel_port:$mtu:$status:$service"
+        tunnel_info["$count"]="$transport:$domain:$backend:$backend_port:$tag:$key:$tunnel_port:$mtu:$pubkey:$status:$service"
         
     done < "$TUNNELS_DB"
     
@@ -814,7 +927,7 @@ list_tunnels() {
         done
         
         local selected_info="${tunnel_info[$choice]}"
-        IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu status service <<< "$selected_info"
+        IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey status service <<< "$selected_info"
         
         local transport_color="$C_CYAN"
         case $transport in
@@ -841,13 +954,11 @@ list_tunnels() {
         [[ "$status" == "failed" ]] && status_icon="💀"
         
         local fingerprint="N/A"
-        if [[ "$transport" == "slipstream" && -f "$DB_DIR/slipstream_cert.pem" ]]; then
-            fingerprint=$(openssl x509 -in "$DB_DIR/slipstream_cert.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d'=' -f2)
-        fi
-        
-        local pub_key="N/A"
-        if [[ "$transport" == "dnstt" && -n "$key" ]]; then
-            pub_key="${key}"
+        if [[ "$transport" == "slipstream" ]]; then
+            local cert_file="$DB_DIR/slipstream_${tag}_cert.pem"
+            if [[ -f "$cert_file" ]]; then
+                fingerprint=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null | cut -d'=' -f2)
+            fi
         fi
         
         echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -877,11 +988,11 @@ list_tunnels() {
             echo -e "${C_PURPLE}│${C_RESET} ${C_BOLD}${C_WHITE}MTU:${C_RESET}        ${C_GREEN}Adaptive (auto-optimized)${C_RESET}"
         fi
         
-        if [[ "$transport" == "dnstt" && "$pub_key" != "N/A" ]]; then
+        if [[ "$transport" == "dnstt" && -n "$pubkey" ]]; then
             echo -e "${C_PURPLE}│${C_RESET}"
             echo -e "${C_PURPLE}│${C_RESET} ${C_BOLD}${C_WHITE}Public Key${C_RESET}"
-            local pk1="${pub_key:0:48}"
-            local pk2="${pub_key:48}"
+            local pk1="${pubkey:0:48}"
+            local pk2="${pubkey:48}"
             echo -e "${C_PURPLE}│${C_RESET} ${C_ORANGE}${pk1}${C_RESET}"
             [[ -n "$pk2" ]] && echo -e "${C_PURPLE}│${C_RESET} ${C_ORANGE}${pk2}${C_RESET}"
         fi
@@ -943,7 +1054,7 @@ delete_tunnel() {
     fi
     
     echo -e "${C_CYAN}Current tunnels:${C_RESET}"
-    cat -n "$TUNNELS_DB" | while IFS=: read -r num transport domain backend backend_port tag key tunnel_port mtu; do
+    cat -n "$TUNNELS_DB" | while IFS=: read -r num transport domain backend backend_port tag key tunnel_port mtu pubkey; do
         local backend_display=""
         case $backend in
             ssh) backend_display="SSH" ;;
@@ -996,6 +1107,16 @@ delete_tunnel() {
     systemctl stop "$service" 2>/dev/null || true
     systemctl disable "$service" 2>/dev/null || true
     rm -f "/etc/systemd/system/${service}.service"
+    
+    # Remove certificate files for Slipstream
+    if [[ "$transport" == "slipstream" ]]; then
+        rm -f "$DB_DIR/slipstream_${tag}_cert.pem" "$DB_DIR/slipstream_${tag}_key.pem" 2>/dev/null
+    fi
+    
+    # Remove key files for DNSTT
+    if [[ "$transport" == "dnstt" ]]; then
+        rm -f "$DB_DIR/keys/${domain}.key" "$DB_DIR/keys/${domain}.pub" 2>/dev/null
+    fi
     
     if [[ "$backend" == "socks" ]]; then
         local backend_service="microsocks-${tag}"
@@ -1423,7 +1544,7 @@ generate_ssh_client_config() {
     
     echo -e "\n${C_BOLD}🔹 DNS TUNNEL CONNECTIONS:${C_RESET}"
     if [[ -f "$TUNNELS_DB" ]]; then
-        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
             if [[ "$backend" == "ssh" ]]; then
                 local transport_display=""
                 case $transport in
@@ -1460,7 +1581,7 @@ DIRECT SSH CONNECTION:
 
 DNS TUNNEL CONNECTIONS:
 EOF
-    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
         if [[ "$backend" == "ssh" ]]; then
             local transport_display=""
             case $transport in
@@ -1513,7 +1634,7 @@ generate_socks5_client_config() {
     
     echo -e "\n${C_BOLD}🔹 DNS TUNNEL SOCKS5 CONNECTIONS:${C_RESET}"
     if [[ -f "$TUNNELS_DB" ]]; then
-        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
             if [[ "$backend" == "socks" ]]; then
                 local transport_display=""
                 case $transport in
@@ -1557,7 +1678,7 @@ DIRECT SOCKS5 CONNECTION:
 
 DNS TUNNEL SOCKS5 CONNECTIONS:
 EOF
-    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+    while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
         if [[ "$backend" == "socks" ]]; then
             local transport_display=""
             case $transport in
@@ -2276,7 +2397,7 @@ list_users() {
     press_enter
 }
 
-# ========== 19. SUPER SPEED BOOSTER ==========
+# ========== 19. SUPER SPEED BOOSTER (FIXED - WITH PRESS ENTER) ==========
 apply_speed_booster() {
     clear
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2309,6 +2430,7 @@ apply_speed_booster() {
     echo -e "\n${C_BLUE}⚡ Applying Super Speed Booster level $level...${C_RESET}"
     echo -e "${C_DIM}Optimizing DNSTT for maximum performance...${C_RESET}\n"
     
+    # ---- Apply settings based on level ----
     case $level in
         1)
             echo -e "${C_CYAN}▶ LIGHTNING MODE - Light speed activation${C_RESET}"
@@ -2485,6 +2607,7 @@ apply_speed_booster() {
             ;;
     esac
     
+    # ---- DNSTT Noise Protocol Optimization ----
     echo -e "\n${C_BLUE}🔧 DNSTT Noise Protocol Optimization...${C_RESET}"
     echo "fs.file-max = 2097152" >> /etc/sysctl.conf 2>/dev/null
     echo "fs.nr_open = 2097152" >> /etc/sysctl.conf 2>/dev/null
@@ -2530,9 +2653,10 @@ net.ipv4.tcp_keepalive_probes=3
 # ============================================================
 EOF
 
+    # ---- Restart DNSTT services ----
     echo -e "\n${C_BLUE}🔄 Restarting DNSTT services...${C_RESET}"
     if [[ -f "$TUNNELS_DB" ]]; then
-        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
             if [[ "$transport" == "dnstt" ]]; then
                 local service="voltron-${transport}-${tag}"
                 if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -2546,6 +2670,7 @@ EOF
     systemctl restart gost-dns 2>/dev/null
     systemctl restart voltron-limiter 2>/dev/null
     
+    # ---- Show summary ----
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}              ✅ SUPER SPEED BOOSTER APPLIED!                 ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2561,7 +2686,9 @@ EOF
     echo -e "  ${C_DIM}2. Check UDP buffer: sysctl net.core.rmem_max${C_RESET}"
     echo -e "  ${C_DIM}3. Monitor bandwidth: bmon or nethogs${C_RESET}"
     
-    press_enter
+    # ---- FIXED: ADD PRESS ENTER ----
+    echo ""
+    press_enter  # <-- HII ILIKOSA!
 }
 
 # ========== 20. SETUP FIREWALL ==========
@@ -2638,11 +2765,21 @@ uninstall_script() {
     echo -e "\n${C_BLUE}🛑 Stopping and removing all services...${C_RESET}"
     
     if [[ -f "$TUNNELS_DB" ]]; then
-        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu; do
+        while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
             local service="voltron-${transport}-${tag}"
             systemctl stop "$service" 2>/dev/null || true
             systemctl disable "$service" 2>/dev/null || true
             rm -f "/etc/systemd/system/${service}.service"
+            
+            # Remove certificate files for Slipstream
+            if [[ "$transport" == "slipstream" ]]; then
+                rm -f "$DB_DIR/slipstream_${tag}_cert.pem" "$DB_DIR/slipstream_${tag}_key.pem" 2>/dev/null
+            fi
+            
+            # Remove key files for DNSTT
+            if [[ "$transport" == "dnstt" ]]; then
+                rm -f "$DB_DIR/keys/${domain}.key" "$DB_DIR/keys/${domain}.pub" 2>/dev/null
+            fi
             
             if [[ "$backend" == "socks" ]]; then
                 local backend_service="microsocks-${tag}"
@@ -2804,7 +2941,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR
+mkdir -p $DB_DIR $BACKUP_DIR $BANNER_DIR $BANDWIDTH_DIR $PID_DIR $CONFIG_DIR $DB_DIR/keys
 touch $SSH_USERS_DB $SOCKS5_USERS_DB $TUNNELS_DB $MICROSOCKS_AUTH
 
 setup_command
