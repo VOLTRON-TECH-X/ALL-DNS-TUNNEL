@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# VOLTRON GATE v7.3 (DNSTM STYLE - PRE-COMPILED BINARIES)
+# VOLTRON GATE v7.3 (DNSTM STYLE - WITH EMBEDDED SOCKS5)
 # - Bandwidth monitoring kwa SSH na SOCKS5 users
 # - Data limiter (auto-lock when quota exceeded)
 # - Expiry date kwa users
 # - DNS tunnel methods: DNSTT na Slipstream tu
 # - GOST DNS Router (multiplexing kwenye port 53)
-# - microsocks SOCKS5 proxy
+# - Custom SOCKS5 proxy (embedded Python)
 # - deSEC auto domain generation
 # - SSH Banner kwa kila user
 # - Super Speed Booster Levels 1-7
@@ -20,7 +20,6 @@
 # - DNSTT Keys kwa Falcon style
 # - Unique certificate kwa kila Slipstream tunnel
 # - Domain options kwa namba (1/2)
-# - microsocks imehakikishiwa inafanya kazi
 # ============================================================================
 
 set -euo pipefail
@@ -75,7 +74,7 @@ TUNNEL_PORT_START=5300
 BACKEND_PORT_START=30000
 
 # ========== BINARY URLS (PRE-COMPILED) ==========
-# microsocks (SOCKS5)
+# microsocks (SOCKS5) - backup only
 MICROSOCKS_URL="https://github.com/rofl0r/microsocks/releases/latest/download/microsocks"
 
 # GOST DNS Router v2.12.0
@@ -161,7 +160,439 @@ find_unique_port() {
     done
 }
 
-# ========== 1. AUTO-INSTALL BINARIES (PRE-COMPILED) ==========
+# ========== 1. CREATE EMBEDDED CUSTOM SOCKS5 PROXY ==========
+create_custom_socks5() {
+    log "📝 Creating custom SOCKS5 proxy (embedded)..."
+    
+    # Hakikisha Python 3 ipo
+    if ! command -v python3 &>/dev/null; then
+        apt update && apt install -y python3
+    fi
+    
+    # Unda script ya Python moja kwa moja
+    cat > "$BIN_DIR/socks5-custom.py" << 'PYTHON_SCRIPT'
+#!/usr/bin/env python3
+# ============================================================================
+# VOLTRON CUSTOM SOCKS5 PROXY - Embedded Version
+# ============================================================================
+
+import socket
+import threading
+import struct
+import sys
+import os
+import time
+import logging
+from datetime import datetime
+
+# ========== CONFIGURATION ==========
+SOCKS5_PORT = 1080
+AUTH_FILE = "/etc/voltron-gate/microsocks.auth"
+BANDWIDTH_DIR = "/etc/voltron-gate/bandwidth"
+LOG_FILE = "/var/log/voltron-socks5.log"
+
+# ========== SETUP LOGGING ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== BANDWIDTH TRACKER ==========
+class BandwidthTracker:
+    def __init__(self):
+        self.usage = {}
+        self.lock = threading.Lock()
+        self.load_usage()
+    
+    def load_usage(self):
+        if not os.path.exists(BANDWIDTH_DIR):
+            os.makedirs(BANDWIDTH_DIR, exist_ok=True)
+        
+        for file in os.listdir(BANDWIDTH_DIR):
+            if file.endswith('.socks5.usage'):
+                username = file.replace('.socks5.usage', '')
+                try:
+                    with open(os.path.join(BANDWIDTH_DIR, file), 'r') as f:
+                        data = f.read().strip()
+                        if data:
+                            self.usage[username] = int(data)
+                except:
+                    pass
+    
+    def save_usage(self, username):
+        with self.lock:
+            if username in self.usage:
+                usage_file = os.path.join(BANDWIDTH_DIR, f"{username}.socks5.usage")
+                try:
+                    with open(usage_file, 'w') as f:
+                        f.write(str(self.usage[username]))
+                except Exception as e:
+                    logger.error(f"Failed to save usage for {username}: {e}")
+    
+    def add_usage(self, username, bytes_count):
+        if username == "unknown":
+            return
+        
+        with self.lock:
+            if username not in self.usage:
+                self.usage[username] = 0
+            self.usage[username] += bytes_count
+            self.save_usage(username)
+    
+    def get_usage(self, username):
+        with self.lock:
+            return self.usage.get(username, 0)
+
+# ========== AUTHENTICATION ==========
+class Authenticator:
+    def __init__(self):
+        self.cache = {}
+        self.cache_time = {}
+        self.cache_ttl = 60
+    
+    def authenticate(self, username, password):
+        cache_key = f"{username}:{password}"
+        current_time = time.time()
+        
+        if cache_key in self.cache:
+            if current_time - self.cache_time.get(cache_key, 0) < self.cache_ttl:
+                return self.cache[cache_key]
+        
+        try:
+            if not os.path.exists(AUTH_FILE):
+                os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+                open(AUTH_FILE, 'a').close()
+                return False
+            
+            with open(AUTH_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if ':' in line:
+                        u, p = line.split(':', 1)
+                        if u == username and p == password:
+                            self.cache[cache_key] = True
+                            self.cache_time[cache_key] = current_time
+                            return True
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+        
+        self.cache[cache_key] = False
+        self.cache_time[cache_key] = current_time
+        return False
+
+# ========== SOCKS5 PROXY ==========
+class Socks5Proxy:
+    def __init__(self, port=1080):
+        self.port = port
+        self.server_socket = None
+        self.running = False
+        self.auth = Authenticator()
+        self.bandwidth_tracker = BandwidthTracker()
+    
+    def start(self):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', self.port))
+            self.server_socket.listen(100)
+            self.running = True
+            
+            logger.info(f"🔌 Custom SOCKS5 Proxy started on port {self.port}")
+            logger.info(f"📁 Auth file: {AUTH_FILE}")
+            logger.info(f"📊 Bandwidth directory: {BANDWIDTH_DIR}")
+            
+            while self.running:
+                try:
+                    client_socket, addr = self.server_socket.accept()
+                    logger.info(f"📡 Connection from {addr[0]}:{addr[1]}")
+                    
+                    client_handler = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket,)
+                    )
+                    client_handler.daemon = True
+                    client_handler.start()
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Accept error: {e}")
+                    
+        except KeyboardInterrupt:
+            logger.info("🛑 Shutting down...")
+        except Exception as e:
+            logger.error(f"❌ Server error: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+        logger.info("🛑 SOCKS5 Proxy stopped")
+    
+    def handle_client(self, client_socket):
+        username = None
+        
+        try:
+            # Handshake
+            data = client_socket.recv(2)
+            if len(data) < 2:
+                return
+            
+            version, nmethods = struct.unpack('BB', data)
+            if version != 5:
+                return
+            
+            methods = client_socket.recv(nmethods)
+            auth_method = 0xff
+            
+            if 2 in methods:
+                auth_method = 0x02
+            elif 0 in methods:
+                auth_method = 0x00
+            else:
+                return
+            
+            client_socket.send(struct.pack('BB', 5, auth_method))
+            
+            if auth_method == 0x02:
+                data = client_socket.recv(1)
+                if not data:
+                    return
+                
+                auth_version = data[0]
+                if auth_version != 1:
+                    return
+                
+                ulen = client_socket.recv(1)[0]
+                username = client_socket.recv(ulen).decode('utf-8', errors='ignore')
+                
+                plen = client_socket.recv(1)[0]
+                password = client_socket.recv(plen).decode('utf-8', errors='ignore')
+                
+                if self.auth.authenticate(username, password):
+                    client_socket.send(b'\x05\x00')
+                    logger.info(f"🔐 User authenticated: {username}")
+                else:
+                    client_socket.send(b'\x05\x01')
+                    logger.warning(f"❌ Auth failed: {username}")
+                    return
+            else:
+                username = "anonymous"
+            
+            # Read request
+            data = client_socket.recv(4)
+            if len(data) < 4:
+                return
+            
+            ver, cmd, rsv, atyp = struct.unpack('BBBB', data)
+            if cmd != 1:
+                return
+            
+            if atyp == 1:
+                addr = socket.inet_ntoa(client_socket.recv(4))
+            elif atyp == 3:
+                dlen = client_socket.recv(1)[0]
+                addr = client_socket.recv(dlen).decode('utf-8', errors='ignore')
+            elif atyp == 4:
+                addr = socket.inet_ntop(socket.AF_INET6, client_socket.recv(16))
+            else:
+                return
+            
+            port = struct.unpack('>H', client_socket.recv(2))[0]
+            
+            # Connect
+            remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_socket.connect((addr, port))
+            
+            client_socket.send(struct.pack('!BBBB', 5, 0, 0, 1, *socket.inet_aton('0.0.0.0'), 0, 0))
+            
+            logger.info(f"✅ Connected: {username} -> {addr}:{port}")
+            
+            # Relay data
+            self.relay_data(client_socket, remote_socket, username)
+            remote_socket.close()
+            
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass
+    
+    def relay_data(self, client_socket, remote_socket, username):
+        client_socket.setblocking(False)
+        remote_socket.setblocking(False)
+        
+        client_socket.settimeout(5)
+        remote_socket.settimeout(5)
+        
+        while True:
+            try:
+                try:
+                    data = client_socket.recv(65536)
+                    if data:
+                        remote_socket.send(data)
+                        self.bandwidth_tracker.add_usage(username, len(data))
+                except socket.timeout:
+                    pass
+                except:
+                    break
+                
+                try:
+                    data = remote_socket.recv(65536)
+                    if data:
+                        client_socket.send(data)
+                except socket.timeout:
+                    pass
+                except:
+                    break
+                    
+            except:
+                break
+
+# ========== MAIN ==========
+def main():
+    if os.geteuid() != 0:
+        print("❌ Error: Requires root privileges")
+        sys.exit(1)
+    
+    os.makedirs(BANDWIDTH_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    
+    if not os.path.exists(AUTH_FILE):
+        os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+        open(AUTH_FILE, 'a').close()
+    
+    proxy = Socks5Proxy(SOCKS5_PORT)
+    proxy.start()
+
+if __name__ == "__main__":
+    main()
+PYTHON_SCRIPT
+
+    chmod +x "$BIN_DIR/socks5-custom.py"
+    success "Custom SOCKS5 proxy created at $BIN_DIR/socks5-custom.py"
+}
+
+# ========== 2. START CUSTOM SOCKS5 PROXY ==========
+start_custom_socks5() {
+    log "Starting custom SOCKS5 proxy..."
+    
+    # Hakikisha script ipo
+    if [[ ! -f "$BIN_DIR/socks5-custom.py" ]]; then
+        create_custom_socks5
+    fi
+    
+    # Hakikisha Python 3 ipo
+    if ! command -v python3 &>/dev/null; then
+        apt update && apt install -y python3
+    fi
+    
+    # Hakikisha auth file ipo
+    touch "$MICROSOCKS_AUTH"
+    chmod 644 "$MICROSOCKS_AUTH"
+    
+    # Hakikisha bandwidth directory ipo
+    mkdir -p "$BANDWIDTH_DIR"
+    
+    # Stop existing services
+    systemctl stop microsocks-main 2>/dev/null || true
+    systemctl stop custom-socks5 2>/dev/null || true
+    pkill -f microsocks 2>/dev/null || true
+    pkill -f socks5-custom 2>/dev/null || true
+    sleep 2
+    
+    # Hakikisha port 1080 ni free
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        echo -e "${C_YELLOW}⚠️ Port $SOCKS5_PORT is in use. Killing existing process...${C_RESET}"
+        fuser -k "$SOCKS5_PORT/tcp" 2>/dev/null || true
+        sleep 2
+    fi
+    
+    # Unda systemd service
+    cat > "/etc/systemd/system/custom-socks5.service" << 'EOF'
+[Unit]
+Description=Custom SOCKS5 Proxy (Voltron Gate)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/socks5-custom.py
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable custom-socks5 2>/dev/null || true
+    systemctl start custom-socks5
+    
+    sleep 3
+    
+    # Thibitisha
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        success "Custom SOCKS5 proxy started on port $SOCKS5_PORT"
+        success "Auth file: $MICROSOCKS_AUTH"
+        success "Log file: /var/log/voltron-socks5.log"
+        return 0
+    else
+        error "Failed to start custom SOCKS5 proxy"
+        echo -e "${C_YELLOW}💡 Trying manual start...${C_RESET}"
+        
+        # Jaribu manual
+        python3 "$BIN_DIR/socks5-custom.py" &
+        sleep 3
+        
+        if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+            success "Custom SOCKS5 proxy started manually on port $SOCKS5_PORT"
+            return 0
+        else
+            error "Failed to start custom SOCKS5 proxy"
+            journalctl -u custom-socks5 -n 10 --no-pager
+            return 1
+        fi
+    fi
+}
+
+# ========== 3. STOP CUSTOM SOCKS5 PROXY ==========
+stop_custom_socks5() {
+    log "Stopping custom SOCKS5 proxy..."
+    systemctl stop custom-socks5 2>/dev/null || true
+    pkill -f socks5-custom 2>/dev/null || true
+    success "Custom SOCKS5 proxy stopped"
+}
+
+# ========== 4. STATUS CUSTOM SOCKS5 PROXY ==========
+status_custom_socks5() {
+    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
+        local pid=$(ss -tlnp | grep ":${SOCKS5_PORT}" | grep -oP 'pid=\K[0-9]+')
+        echo -e "${C_GREEN}✅ Custom SOCKS5 proxy is running on port $SOCKS5_PORT (PID: $pid)${C_RESET}"
+        return 0
+    else
+        echo -e "${C_RED}❌ Custom SOCKS5 proxy is not running${C_RESET}"
+        return 1
+    fi
+}
+
+# ========== 5. AUTO-INSTALL BINARIES ==========
 install_binaries() {
     log "📥 Installing DNS tunnel binaries (pre-compiled)..."
     
@@ -195,28 +626,14 @@ install_binaries() {
     
     # ---- Install dependencies ----
     log "Installing dependencies..."
-    apt update && apt install -y curl wget bc iptables net-tools unzip
+    apt update && apt install -y curl wget bc iptables net-tools unzip python3
     
     # ---- Create user ----
     if ! id "voltrondns" &>/dev/null; then
         useradd -r -s /usr/sbin/nologin voltrondns
     fi
     
-    # ---- 1.1 microsocks (SOCKS5) ----
-    log "Installing microsocks..."
-    if ! command -v microsocks &>/dev/null; then
-        if wget -q "$MICROSOCKS_URL" -O "$BIN_DIR/microsocks"; then
-            chmod +x "$BIN_DIR/microsocks"
-            success "microsocks installed"
-        else
-            echo -e "${C_RED}❌ Failed to download microsocks${C_RESET}"
-            return 1
-        fi
-    else
-        success "microsocks already installed"
-    fi
-    
-    # ---- 1.2 GOST DNS Router v2.12.0 ----
+    # ---- 1.1 GOST DNS Router v2.12.0 ----
     log "Installing GOST DNS Router v2.12.0..."
     if ! command -v gost &>/dev/null; then
         echo -e "${C_BLUE}📥 Downloading GOST v2.12.0...${C_RESET}"
@@ -251,7 +668,7 @@ install_binaries() {
         success "GOST already installed: $gost_version"
     fi
     
-    # ---- 1.3 DNSTT Server (Falcon style) ----
+    # ---- 1.2 DNSTT Server (Falcon style) ----
     log "Installing DNSTT server..."
     if ! command -v dnstt-server &>/dev/null; then
         if wget -q "$DNSTT_URL" -O "$BIN_DIR/dnstt-server"; then
@@ -265,7 +682,7 @@ install_binaries() {
         success "DNSTT server already installed"
     fi
     
-    # ---- 1.4 DNSTT Client ----
+    # ---- 1.3 DNSTT Client ----
     log "Installing DNSTT client..."
     if ! command -v dnstt-client &>/dev/null; then
         if wget -q "$DNSTT_CLIENT_URL" -O "$BIN_DIR/dnstt-client"; then
@@ -278,7 +695,7 @@ install_binaries() {
         success "DNSTT client already installed"
     fi
     
-    # ---- 1.5 Slipstream Server (Falcon style) ----
+    # ---- 1.4 Slipstream Server (Falcon style) ----
     log "Installing Slipstream server..."
     if ! command -v slipstream-server &>/dev/null; then
         if wget -q "$SLIPSTREAM_URL" -O "$BIN_DIR/slipstream-server"; then
@@ -292,6 +709,9 @@ install_binaries() {
         success "Slipstream already installed"
     fi
     
+    # ---- 1.5 Create custom SOCKS5 (instead of microsocks) ----
+    create_custom_socks5
+    
     # ---- Set ownership ----
     chown -R voltrondns:voltrondns "$DB_DIR" 2>/dev/null || true
     
@@ -303,16 +723,16 @@ install_binaries() {
     echo -e "${C_GREEN}${C_BOLD}              ✅ ALL BINARIES INSTALLED!                     ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "  ${C_BOLD}Architecture:${C_RESET}   ${C_YELLOW}$arch${C_RESET}"
-    echo -e "  ${C_BOLD}microsocks:${C_RESET}     ${C_GREEN}$(command -v microsocks 2>/dev/null || echo 'Not found')${C_RESET}"
     echo -e "  ${C_BOLD}gost:${C_RESET}           ${C_GREEN}$(command -v gost 2>/dev/null || echo 'Not found')${C_RESET}"
     echo -e "  ${C_BOLD}dnstt-server:${C_RESET}   ${C_GREEN}$(command -v dnstt-server 2>/dev/null || echo 'Not found')${C_RESET}"
     echo -e "  ${C_BOLD}slipstream-server:${C_RESET} ${C_GREEN}$(command -v slipstream-server 2>/dev/null || echo 'Not found')${C_RESET}"
+    echo -e "  ${C_BOLD}custom SOCKS5:${C_RESET}  ${C_GREEN}$(command -v python3 2>/dev/null || echo 'Not found')${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     
     press_enter
 }
 
-# ========== 2. GENERATE DESEC DOMAIN (FIXED - FALCON STYLE) ==========
+# ========== 6. GENERATE DESEC DOMAIN ==========
 gen_desec_domain() {
     local transport=$1
     local backend=$2
@@ -412,118 +832,7 @@ EOF
     echo "$full_domain"
 }
 
-# ========== 3. START MICROSOCKS (FIXED - HAKIKISHA INAFANYA KAZI) ==========
-start_microsocks() {
-    log "Starting microsocks on port $SOCKS5_PORT..."
-    
-    # ---- Hakikisha binary ipo na ina ruhusa ----
-    if ! command -v microsocks &>/dev/null; then
-        log "microsocks not found. Downloading..."
-        wget -q -O "$BIN_DIR/microsocks" "$MICROSOCKS_URL"
-        chmod +x "$BIN_DIR/microsocks"
-        success "microsocks downloaded"
-    else
-        # Hakikisha ina ruhusa
-        chmod +x "$BIN_DIR/microsocks"
-    fi
-    
-    # ---- Hakikisha auth file ipo ----
-    touch "$MICROSOCKS_AUTH"
-    chmod 644 "$MICROSOCKS_AUTH"
-    
-    # ---- Stop existing service ----
-    systemctl stop microsocks-main 2>/dev/null || true
-    pkill -f microsocks 2>/dev/null || true
-    sleep 1
-    
-    # ---- Hakikisha port 1080 haijachukuliwa ----
-    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-        echo -e "${C_YELLOW}⚠️ Port $SOCKS5_PORT is in use. Killing existing process...${C_RESET}"
-        fuser -k "$SOCKS5_PORT/tcp" 2>/dev/null || true
-        sleep 1
-    fi
-    
-    # ---- Unda service file ----
-    cat > "/etc/systemd/system/microsocks-main.service" << EOF
-[Unit]
-Description=MicroSocks SOCKS5 Proxy (Main)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/microsocks -p $SOCKS5_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH
-Restart=always
-RestartSec=10
-RestartPreventExitStatus=255
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    
-    # ---- Anzisha service ----
-    if systemctl start microsocks-main 2>/dev/null; then
-        systemctl enable microsocks-main 2>/dev/null || true
-        sleep 2
-        
-        if systemctl is-active --quiet microsocks-main; then
-            success "microsocks started on port $SOCKS5_PORT"
-            return 0
-        fi
-    fi
-    
-    # ---- Ikiwa systemd inashindwa, jaribu manual ----
-    echo -e "${C_YELLOW}⚠️ Service failed. Trying manual start...${C_RESET}"
-    
-    # Hakikisha binary ina ruhusa
-    chmod +x "$BIN_DIR/microsocks"
-    
-    # Anzisha manual katika background
-    nohup "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 -a "$MICROSOCKS_AUTH" > /dev/null 2>&1 &
-    
-    sleep 3
-    
-    # ---- Thibitisha kama imeanza ----
-    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-        success "microsocks started manually on port $SOCKS5_PORT"
-        return 0
-    fi
-    
-    # ---- Jaribu njia nyingine ----
-    echo -e "${C_YELLOW}⚠️ Manual start failed. Trying with direct execution...${C_RESET}"
-    
-    # Anzisha na uweke kwenye background
-    "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 -a "$MICROSOCKS_AUTH" &
-    
-    sleep 2
-    
-    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-        success "microsocks started on port $SOCKS5_PORT"
-        return 0
-    fi
-    
-    # ---- Ikiwa bado inashindwa, angalia port ----
-    echo -e "${C_RED}❌ Failed to start microsocks${C_RESET}"
-    echo -e "${C_YELLOW}💡 Checking if port $SOCKS5_PORT is in use...${C_RESET}"
-    ss -tlnp | grep ":${SOCKS5_PORT}" || echo -e "${C_DIM}Port $SOCKS5_PORT is free.${C_RESET}"
-    
-    # ---- Jaribu kuanza na option nyingine ----
-    echo -e "${C_YELLOW}💡 Trying to start microsocks without auth...${C_RESET}"
-    "$BIN_DIR/microsocks" -p "$SOCKS5_PORT" -i 127.0.0.1 &
-    sleep 2
-    
-    if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-        echo -e "${C_YELLOW}⚠️ microsocks started without auth (no authentication)${C_RESET}"
-        success "microsocks started on port $SOCKS5_PORT (no auth)"
-        return 0
-    fi
-    
-    return 1
-}
-
-# ========== 4. START DNS ROUTER (GOST) ==========
+# ========== 7. START DNS ROUTER (GOST) ==========
 start_dns_router() {
     log "Starting DNS Router (GOST) on port $DNS_PORT..."
     
@@ -574,7 +883,7 @@ EOF
     success "DNS Router started with $count tunnels"
 }
 
-# ========== 5. ADD TUNNEL ==========
+# ========== 8. ADD TUNNEL ==========
 add_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🚀 ADD DNS TUNNEL                        ${C_RESET}"
@@ -757,38 +1066,7 @@ add_tunnel() {
         echo ""
     fi
     
-    # ---- STEP 8: Start Backend Service (SOCKS5 only) ----
-    if [[ "$BACKEND" == "socks" ]]; then
-        echo -e "${C_BLUE}🔌 Starting backend service on port $BACKEND_PORT...${C_RESET}"
-        
-        local backend_service="microsocks-${TAG}"
-        local backend_service_file="/etc/systemd/system/${backend_service}.service"
-        
-        cat > "$backend_service_file" << EOF
-[Unit]
-Description=MicroSocks SOCKS5 Proxy for $TAG
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/microsocks -p $BACKEND_PORT -i 127.0.0.1 -a $MICROSOCKS_AUTH
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        systemctl enable "$backend_service"
-        systemctl restart "$backend_service"
-        echo -e "${C_GREEN}✅ Backend service started: $backend_service (port $BACKEND_PORT)${C_RESET}\n"
-    else
-        echo -e "${C_YELLOW}ℹ️ SSH backend uses system SSH on port 22${C_RESET}\n"
-    fi
-    
-    # ---- STEP 9: Create Tunnel Service ----
+    # ---- STEP 8: Create Tunnel Service ----
     local service_name="voltron-${TRANSPORT}-${TAG}"
     local service_file="/etc/systemd/system/${service_name}.service"
     
@@ -857,11 +1135,11 @@ EOF
     systemctl enable "$service_name"
     systemctl restart "$service_name"
     
-    # ---- STEP 10: Update GOST DNS Router ----
+    # ---- STEP 9: Update GOST DNS Router ----
     echo -e "\n${C_BLUE}🔄 Updating DNS Router...${C_RESET}"
     systemctl restart gost-dns 2>/dev/null || true
     
-    # ---- STEP 11: Show Summary ----
+    # ---- STEP 10: Show Summary ----
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}                    ✅ TUNNEL CREATED!                       ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -886,7 +1164,7 @@ EOF
     press_enter
 }
 
-# ========== 6. LIST TUNNELS ==========
+# ========== 9. LIST TUNNELS ==========
 list_tunnels() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    📡 ACTIVE TUNNELS                         ${C_RESET}"
@@ -1073,7 +1351,7 @@ list_tunnels() {
     press_enter
 }
 
-# ========== 7. DELETE TUNNEL ==========
+# ========== 10. DELETE TUNNEL ==========
 delete_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🗑️ DELETE TUNNEL                        ${C_RESET}"
@@ -1140,21 +1418,12 @@ delete_tunnel() {
     systemctl disable "$service" 2>/dev/null || true
     rm -f "/etc/systemd/system/${service}.service"
     
-    # Remove certificate files for Slipstream
     if [[ "$transport" == "slipstream" ]]; then
         rm -f "$DB_DIR/slipstream_${tag}_cert.pem" "$DB_DIR/slipstream_${tag}_key.pem" 2>/dev/null
     fi
     
-    # Remove key files for DNSTT
     if [[ "$transport" == "dnstt" ]]; then
         rm -f "$DB_DIR/keys/${domain}.key" "$DB_DIR/keys/${domain}.pub" 2>/dev/null
-    fi
-    
-    if [[ "$backend" == "socks" ]]; then
-        local backend_service="microsocks-${tag}"
-        systemctl stop "$backend_service" 2>/dev/null || true
-        systemctl disable "$backend_service" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${backend_service}.service"
     fi
     
     sed -i "${num}d" "$TUNNELS_DB"
@@ -1165,7 +1434,7 @@ delete_tunnel() {
     press_enter
 }
 
-# ========== 8. LIMITER SERVICE ==========
+# ========== 11. LIMITER SERVICE ==========
 setup_limiter() {
     log "Installing bandwidth monitoring + limiter service..."
     
@@ -1303,7 +1572,7 @@ while true; do
             if [[ $expiry_ts -lt $current_ts && $expiry_ts -ne 0 ]]; then
                 sed -i "/^$user:/d" "$SOCKS5_DB"
                 sed -i "/^$user:/d" "/etc/voltron-gate/microsocks.auth"
-                systemctl restart microsocks-main
+                systemctl restart custom-socks5
                 continue
             fi
             
@@ -1315,7 +1584,7 @@ while true; do
                 if [[ $used_bytes_val -ge $quota_bytes ]]; then
                     sed -i "/^$user:/d" "$SOCKS5_DB"
                     sed -i "/^$user:/d" "/etc/voltron-gate/microsocks.auth"
-                    systemctl restart microsocks-main
+                    systemctl restart custom-socks5
                     sed -i "s/^$user:.*/$user:$pass:$expiry:$limit:$bandwidth_gb:$used_gb:QUOTA_EXCEEDED/" "$SOCKS5_DB"
                 else
                     sed -i "s/^$user:.*/$user:$pass:$expiry:$limit:$bandwidth_gb:$used_gb:ACTIVE/" "$SOCKS5_DB"
@@ -1354,7 +1623,7 @@ EOF
     press_enter
 }
 
-# ========== 9. ADD SSH USER ==========
+# ========== 12. ADD SSH USER ==========
 add_ssh_user() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👤 ADD SSH USER                          ${C_RESET}"
@@ -1454,7 +1723,7 @@ add_ssh_user() {
     press_enter
 }
 
-# ========== 10. ADD SOCKS5 USER ==========
+# ========== 13. ADD SOCKS5 USER ==========
 add_socks5_user() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🔌 ADD SOCKS5 USER                       ${C_RESET}"
@@ -1476,7 +1745,7 @@ add_socks5_user() {
             continue
         fi
         if grep -q "^$u:" "$MICROSOCKS_AUTH" 2>/dev/null; then
-            echo -e "${C_RED}❌ User $u already exists in microsocks auth${C_RESET}"
+            echo -e "${C_RED}❌ User $u already exists in auth file${C_RESET}"
             continue
         fi
         break
@@ -1528,7 +1797,7 @@ add_socks5_user() {
     echo "$u:$p" >> "$MICROSOCKS_AUTH"
     echo "0" > "$BANDWIDTH_DIR/${u}.socks5.usage"
     
-    systemctl restart microsocks-main
+    systemctl restart custom-socks5
     
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}                  ✅ SOCKS5 USER CREATED!                    ${C_RESET}"
@@ -1551,7 +1820,7 @@ add_socks5_user() {
     press_enter
 }
 
-# ========== 11. GENERATE SSH CLIENT CONFIG ==========
+# ========== 14. GENERATE SSH CLIENT CONFIG ==========
 generate_ssh_client_config() {
     local user=$1
     local pass=$2
@@ -1639,7 +1908,7 @@ EOF
     press_enter
 }
 
-# ========== 12. GENERATE SOCKS5 CLIENT CONFIG ==========
+# ========== 15. GENERATE SOCKS5 CLIENT CONFIG ==========
 generate_socks5_client_config() {
     local user=$1
     local pass=$2
@@ -1742,7 +2011,7 @@ EOF
     press_enter
 }
 
-# ========== 13. SSH USER MANAGER ==========
+# ========== 16. SSH USER MANAGER ==========
 ssh_user_menu() {
     while true; do
         clear
@@ -1789,7 +2058,7 @@ ssh_user_menu() {
     done
 }
 
-# ========== 14. SOCKS5 USER MANAGER ==========
+# ========== 17. SOCKS5 USER MANAGER ==========
 socks5_user_menu() {
     while true; do
         clear
@@ -1798,12 +2067,12 @@ socks5_user_menu() {
         echo -e "${C_PURPLE}╚═══════════════════════════════════════════════════════════════╝${C_RESET}"
         
         local total_users=$(wc -l < "$SOCKS5_USERS_DB" 2>/dev/null || echo 0)
-        local microsocks_status=$(systemctl is-active microsocks-main 2>/dev/null || echo "inactive")
+        local socks5_status=$(ss -tlnp | grep -q ":${SOCKS5_PORT}" && echo "active" || echo "inactive")
         local status_color="$C_GREEN"
-        [[ "$microsocks_status" == "inactive" ]] && status_color="$C_RED"
+        [[ "$socks5_status" == "inactive" ]] && status_color="$C_RED"
         
         echo -e "${C_DIM}📊 Total SOCKS5 Users: ${C_YELLOW}$total_users${C_RESET}"
-        echo -e "${C_DIM}🔌 Microsocks: ${status_color}$microsocks_status${C_RESET} (port $SOCKS5_PORT)"
+        echo -e "${C_DIM}🔌 SOCKS5 Proxy: ${status_color}$socks5_status${C_RESET} (port $SOCKS5_PORT)"
         echo ""
         
         echo -e "  ${C_GREEN}[1]${C_RESET} Add SOCKS5 User"
@@ -1811,8 +2080,10 @@ socks5_user_menu() {
         echo -e "  ${C_GREEN}[3]${C_RESET} View SOCKS5 User Bandwidth"
         echo -e "  ${C_GREEN}[4]${C_RESET} Renew SOCKS5 User"
         echo -e "  ${C_GREEN}[5]${C_RESET} Delete SOCKS5 User"
-        echo -e "  ${C_GREEN}[6]${C_RESET} Restart Microsocks"
-        echo -e "  ${C_GREEN}[7]${C_RESET} Generate SOCKS5 Client Config"
+        echo -e "  ${C_GREEN}[6]${C_RESET} Start SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[7]${C_RESET} Stop SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[8]${C_RESET} Status SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[9]${C_RESET} Generate SOCKS5 Client Config"
         echo ""
         echo -e "  ${C_RED}[0]${C_RESET} Return to Main Menu"
         echo ""
@@ -1821,8 +2092,8 @@ socks5_user_menu() {
         while true; do
             read -p "👉 Select option: " opt
             case $opt in
-                1|2|3|4|5|6|7|0) break ;;
-                *) echo -e "${C_RED}❌ Invalid option. Please enter 0-7.${C_RESET}" ;;
+                1|2|3|4|5|6|7|8|9|0) break ;;
+                *) echo -e "${C_RED}❌ Invalid option. Please enter 0-9.${C_RESET}" ;;
             esac
         done
         
@@ -1832,71 +2103,16 @@ socks5_user_menu() {
             3) view_socks5_bandwidth ;;
             4) renew_socks5_user ;;
             5) delete_socks5_user ;;
-            6) systemctl restart microsocks-main; echo -e "${C_GREEN}✅ Microsocks restarted${C_RESET}"; press_enter ;;
-            7) generate_socks5_client_config_menu ;;
+            6) start_custom_socks5 ;;
+            7) stop_custom_socks5 ;;
+            8) status_custom_socks5 ;;
+            9) generate_socks5_client_config_menu ;;
             0) return ;;
         esac
     done
 }
 
-# ========== 15. GENERATE CLIENT CONFIG MENUS ==========
-generate_ssh_client_config_menu() {
-    echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}                    📱 GENERATE SSH CLIENT CONFIG            ${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}\n"
-    
-    if [[ ! -f "$SSH_USERS_DB" || ! -s "$SSH_USERS_DB" ]]; then
-        echo -e "${C_YELLOW}ℹ️ No SSH users found.${C_RESET}"
-        press_enter
-        return
-    fi
-    
-    echo -e "${C_CYAN}Available SSH users:${C_RESET}"
-    cut -d: -f1 "$SSH_USERS_DB" | cat -n
-    echo ""
-    
-    local username
-    while true; do
-        read -p "Enter username: " username
-        if grep -q "^$username:" "$SSH_USERS_DB" 2>/dev/null; then
-            break
-        fi
-        echo -e "${C_RED}❌ User not found.${C_RESET}"
-    done
-    
-    local pass=$(grep "^$username:" "$SSH_USERS_DB" | cut -d: -f2)
-    generate_ssh_client_config "$username" "$pass"
-}
-
-generate_socks5_client_config_menu() {
-    echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}                    📱 GENERATE SOCKS5 CLIENT CONFIG          ${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}\n"
-    
-    if [[ ! -f "$SOCKS5_USERS_DB" || ! -s "$SOCKS5_USERS_DB" ]]; then
-        echo -e "${C_YELLOW}ℹ️ No SOCKS5 users found.${C_RESET}"
-        press_enter
-        return
-    fi
-    
-    echo -e "${C_CYAN}Available SOCKS5 users:${C_RESET}"
-    cut -d: -f1 "$SOCKS5_USERS_DB" | cat -n
-    echo ""
-    
-    local username
-    while true; do
-        read -p "Enter username: " username
-        if grep -q "^$username:" "$SOCKS5_USERS_DB" 2>/dev/null; then
-            break
-        fi
-        echo -e "${C_RED}❌ User not found.${C_RESET}"
-    done
-    
-    local pass=$(grep "^$username:" "$SOCKS5_USERS_DB" | cut -d: -f2)
-    generate_socks5_client_config "$username" "$pass"
-}
-
-# ========== 16. SSH USER FUNCTIONS ==========
+# ========== 18. SSH USER FUNCTIONS ==========
 list_ssh_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👥 SSH USERS                             ${C_RESET}"
@@ -2164,7 +2380,7 @@ unlock_ssh_user() {
     press_enter
 }
 
-# ========== 17. SOCKS5 USER FUNCTIONS ==========
+# ========== 19. SOCKS5 USER FUNCTIONS ==========
 list_socks5_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🔌 SOCKS5 USERS                          ${C_RESET}"
@@ -2351,13 +2567,13 @@ delete_socks5_user() {
     sed -i "/^$username:/d" "$SOCKS5_USERS_DB"
     sed -i "/^$username:/d" "$MICROSOCKS_AUTH"
     rm -f "$BANDWIDTH_DIR/${username}.socks5.usage"
-    systemctl restart microsocks-main
+    systemctl restart custom-socks5
     
     success "SOCKS5 user $username deleted"
     press_enter
 }
 
-# ========== 18. LIST ALL USERS ==========
+# ========== 20. LIST ALL USERS ==========
 list_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👥 ALL USERS                            ${C_RESET}"
@@ -2429,7 +2645,7 @@ list_users() {
     press_enter
 }
 
-# ========== 19. SUPER SPEED BOOSTER ==========
+# ========== 21. SUPER SPEED BOOSTER ==========
 apply_speed_booster() {
     clear
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2639,7 +2855,6 @@ apply_speed_booster() {
             ;;
     esac
     
-    # ---- DNSTT Noise Protocol Optimization ----
     echo -e "\n${C_BLUE}🔧 DNSTT Noise Protocol Optimization...${C_RESET}"
     echo "fs.file-max = 2097152" >> /etc/sysctl.conf 2>/dev/null
     echo "fs.nr_open = 2097152" >> /etc/sysctl.conf 2>/dev/null
@@ -2685,7 +2900,6 @@ net.ipv4.tcp_keepalive_probes=3
 # ============================================================
 EOF
 
-    # ---- Restart DNSTT services ----
     echo -e "\n${C_BLUE}🔄 Restarting DNSTT services...${C_RESET}"
     if [[ -f "$TUNNELS_DB" ]]; then
         while IFS=: read -r transport domain backend backend_port tag key tunnel_port mtu pubkey; do
@@ -2702,7 +2916,6 @@ EOF
     systemctl restart gost-dns 2>/dev/null
     systemctl restart voltron-limiter 2>/dev/null
     
-    # ---- Show summary ----
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}              ✅ SUPER SPEED BOOSTER APPLIED!                 ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2722,7 +2935,7 @@ EOF
     press_enter
 }
 
-# ========== 20. SETUP FIREWALL ==========
+# ========== 22. SETUP FIREWALL ==========
 setup_firewall() {
     log "Setting up firewall..."
     
@@ -2746,7 +2959,7 @@ setup_firewall() {
     press_enter
 }
 
-# ========== 21. SHOW SYSTEM INFO ==========
+# ========== 23. SHOW SYSTEM INFO ==========
 show_system_info() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    📊 SYSTEM INFORMATION                    ${C_RESET}"
@@ -2765,7 +2978,7 @@ show_system_info() {
     press_enter
 }
 
-# ========== 22. UNINSTALL SCRIPT ==========
+# ========== 24. UNINSTALL SCRIPT ==========
 uninstall_script() {
     clear
     echo -e "${C_RED}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2777,7 +2990,7 @@ uninstall_script() {
     echo -e "  - All DNS tunnels (DNSTT, Slipstream)"
     echo -e "  - All SSH and SOCKS5 users"
     echo -e "  - All configuration files"
-    echo -e "  - All services (gost, microsocks, limiter)"
+    echo -e "  - All services (gost, limiter, custom-socks5)"
     echo -e "  - All binaries (dnstt-server, slipstream-server)"
     echo -e "  - The 'menu' and 'voltron' commands"
     echo ""
@@ -2802,21 +3015,12 @@ uninstall_script() {
             systemctl disable "$service" 2>/dev/null || true
             rm -f "/etc/systemd/system/${service}.service"
             
-            # Remove certificate files for Slipstream
             if [[ "$transport" == "slipstream" ]]; then
                 rm -f "$DB_DIR/slipstream_${tag}_cert.pem" "$DB_DIR/slipstream_${tag}_key.pem" 2>/dev/null
             fi
             
-            # Remove key files for DNSTT
             if [[ "$transport" == "dnstt" ]]; then
                 rm -f "$DB_DIR/keys/${domain}.key" "$DB_DIR/keys/${domain}.pub" 2>/dev/null
-            fi
-            
-            if [[ "$backend" == "socks" ]]; then
-                local backend_service="microsocks-${tag}"
-                systemctl stop "$backend_service" 2>/dev/null || true
-                systemctl disable "$backend_service" 2>/dev/null || true
-                rm -f "/etc/systemd/system/${backend_service}.service"
             fi
         done < "$TUNNELS_DB"
     fi
@@ -2825,9 +3029,9 @@ uninstall_script() {
     systemctl disable gost-dns 2>/dev/null || true
     rm -f "$GOST_SERVICE"
     
-    systemctl stop microsocks-main 2>/dev/null || true
-    systemctl disable microsocks-main 2>/dev/null || true
-    rm -f "/etc/systemd/system/microsocks-main.service"
+    systemctl stop custom-socks5 2>/dev/null || true
+    systemctl disable custom-socks5 2>/dev/null || true
+    rm -f "/etc/systemd/system/custom-socks5.service"
     
     systemctl stop voltron-limiter 2>/dev/null || true
     systemctl disable voltron-limiter 2>/dev/null || true
@@ -2840,7 +3044,7 @@ uninstall_script() {
     rm -f "$BIN_DIR/dnstt-server"
     rm -f "$BIN_DIR/dnstt-client"
     rm -f "$BIN_DIR/slipstream-server"
-    rm -f "$BIN_DIR/microsocks"
+    rm -f "$BIN_DIR/socks5-custom.py"
     rm -f "$BIN_DIR/voltron-limiter.sh"
     
     echo -e "${C_BLUE}🗑️ Removing configuration files...${C_RESET}"
@@ -2874,7 +3078,7 @@ uninstall_script() {
     exit 0
 }
 
-# ========== 23. MAIN MENU ==========
+# ========== 25. MAIN MENU ==========
 main_menu() {
     while true; do
         clear
@@ -2891,23 +3095,30 @@ main_menu() {
         echo -e "  ${C_GREEN}[3]${C_RESET} Delete Tunnel"
         echo ""
         
+        echo -e "  ${C_GREEN}${C_BOLD}🔌 SOCKS5 PROXY${C_RESET}"
+        echo -e "  ──────────────"
+        echo -e "  ${C_GREEN}[4]${C_RESET} Start SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[5]${C_RESET} Stop SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[6]${C_RESET} Status SOCKS5 Proxy"
+        echo -e "  ${C_GREEN}[7]${C_RESET} SOCKS5 User Manager"
+        echo ""
+        
         echo -e "  ${C_GREEN}${C_BOLD}👥 USER MANAGEMENT${C_RESET}"
         echo -e "  ──────────────"
-        echo -e "  ${C_GREEN}[4]${C_RESET} SSH User Manager"
-        echo -e "  ${C_GREEN}[5]${C_RESET} SOCKS5 User Manager"
-        echo -e "  ${C_GREEN}[6]${C_RESET} List All Users"
+        echo -e "  ${C_GREEN}[8]${C_RESET} SSH User Manager"
+        echo -e "  ${C_GREEN}[9]${C_RESET} List All Users"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}⚡ PERFORMANCE${C_RESET}"
         echo -e "  ────────────"
-        echo -e "  ${C_GREEN}[7]${C_RESET} Apply Super Speed Booster (DNSTT)"
-        echo -e "  ${C_GREEN}[8]${C_RESET} Setup Firewall"
-        echo -e "  ${C_GREEN}[9]${C_RESET} Install Limiter Service"
+        echo -e "  ${C_GREEN}[A]${C_RESET} Apply Super Speed Booster (DNSTT)"
+        echo -e "  ${C_GREEN}[B]${C_RESET} Setup Firewall"
+        echo -e "  ${C_GREEN}[C]${C_RESET} Install Limiter Service"
         echo ""
         
         echo -e "  ${C_GREEN}${C_BOLD}ℹ️ INFO${C_RESET}"
         echo -e "  ────────────"
-        echo -e "  ${C_GREEN}[A]${C_RESET} System Info"
+        echo -e "  ${C_GREEN}[D]${C_RESET} System Info"
         echo ""
         
         echo -e "  ${C_RED}${C_BOLD}[0]${C_RESET} Exit"
@@ -2920,17 +3131,16 @@ main_menu() {
             install_binaries
         fi
         
-        # Make sure microsocks is running
-        if ! ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-            echo -e "${C_YELLOW}⚠️ microsocks not running. Starting...${C_RESET}"
-            start_microsocks
+        # Make sure custom SOCKS5 is created if needed
+        if [[ ! -f "$BIN_DIR/socks5-custom.py" ]]; then
+            create_custom_socks5
         fi
         
         local opt
         while true; do
             read -p "👉 Select option: " opt
             case $opt in
-                1|2|3|4|5|6|7|8|9|A|a|0|99)
+                1|2|3|4|5|6|7|8|9|A|a|B|b|C|c|D|d|0|99)
                     break
                     ;;
                 *)
@@ -2945,13 +3155,16 @@ main_menu() {
             1) add_tunnel ;;
             2) list_tunnels ;;
             3) delete_tunnel ;;
-            4) ssh_user_menu ;;
-            5) socks5_user_menu ;;
-            6) list_users ;;
-            7) apply_speed_booster ;;
-            8) setup_firewall ;;
-            9) setup_limiter ;;
-            A) show_system_info ;;
+            4) start_custom_socks5 ;;
+            5) stop_custom_socks5 ;;
+            6) status_custom_socks5 ;;
+            7) socks5_user_menu ;;
+            8) ssh_user_menu ;;
+            9) list_users ;;
+            A) apply_speed_booster ;;
+            B) setup_firewall ;;
+            C) setup_limiter ;;
+            D) show_system_info ;;
             0) 
                 echo -e "${C_GREEN}👋 Goodbye!${C_RESET}"
                 exit 0 
@@ -2988,9 +3201,9 @@ if [[ ! -f "$INSTALL_FLAG" ]] || ! command -v dnstt-server &>/dev/null || ! comm
     install_binaries
 fi
 
-# Make sure microsocks is running
-if ! ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
-    start_microsocks
+# Create custom SOCKS5 if not present
+if [[ ! -f "$BIN_DIR/socks5-custom.py" ]]; then
+    create_custom_socks5
 fi
 
 if ! systemctl is-active --quiet voltron-limiter 2>/dev/null; then
