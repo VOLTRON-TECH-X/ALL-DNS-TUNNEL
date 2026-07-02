@@ -7,7 +7,7 @@
 # - DNS tunnel methods: DNSTT na Slipstream tu
 # - GOST DNS Router (multiplexing kwenye port 53)
 # - Custom SOCKS5 proxy (embedded Python)
-# - deSEC auto domain generation
+# - deSEC auto domain generation (Falcon style)
 # - SSH Banner kwa kila user
 # - Super Speed Booster Levels 1-7
 # - Uninstall script
@@ -20,6 +20,7 @@
 # - DNSTT Keys kwa Falcon style
 # - Unique certificate kwa kila Slipstream tunnel
 # - Domain options kwa namba (1/2)
+# - Falcon style domain generator
 # ============================================================================
 
 set -euo pipefail
@@ -492,38 +493,30 @@ PYTHON_SCRIPT
 start_custom_socks5() {
     log "Starting custom SOCKS5 proxy..."
     
-    # Hakikisha script ipo
     if [[ ! -f "$BIN_DIR/socks5-custom.py" ]]; then
         create_custom_socks5
     fi
     
-    # Hakikisha Python 3 ipo
     if ! command -v python3 &>/dev/null; then
         apt update && apt install -y python3
     fi
     
-    # Hakikisha auth file ipo
     touch "$MICROSOCKS_AUTH"
     chmod 644 "$MICROSOCKS_AUTH"
-    
-    # Hakikisha bandwidth directory ipo
     mkdir -p "$BANDWIDTH_DIR"
     
-    # Stop existing services
     systemctl stop microsocks-main 2>/dev/null || true
     systemctl stop custom-socks5 2>/dev/null || true
     pkill -f microsocks 2>/dev/null || true
     pkill -f socks5-custom 2>/dev/null || true
     sleep 2
     
-    # Hakikisha port 1080 ni free
     if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
         echo -e "${C_YELLOW}⚠️ Port $SOCKS5_PORT is in use. Killing existing process...${C_RESET}"
         fuser -k "$SOCKS5_PORT/tcp" 2>/dev/null || true
         sleep 2
     fi
     
-    # Unda systemd service
     cat > "/etc/systemd/system/custom-socks5.service" << 'EOF'
 [Unit]
 Description=Custom SOCKS5 Proxy (Voltron Gate)
@@ -547,7 +540,6 @@ EOF
     
     sleep 3
     
-    # Thibitisha
     if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
         success "Custom SOCKS5 proxy started on port $SOCKS5_PORT"
         success "Auth file: $MICROSOCKS_AUTH"
@@ -555,12 +547,8 @@ EOF
         return 0
     else
         error "Failed to start custom SOCKS5 proxy"
-        echo -e "${C_YELLOW}💡 Trying manual start...${C_RESET}"
-        
-        # Jaribu manual
         python3 "$BIN_DIR/socks5-custom.py" &
         sleep 3
-        
         if ss -tlnp | grep -q ":${SOCKS5_PORT}"; then
             success "Custom SOCKS5 proxy started manually on port $SOCKS5_PORT"
             return 0
@@ -592,11 +580,238 @@ status_custom_socks5() {
     fi
 }
 
-# ========== 5. AUTO-INSTALL BINARIES ==========
+# ========== 5. GENERATE DNS RECORD (FALCON STYLE - SAFE) ==========
+generate_dns_record() {
+    local transport=$1
+    local backend=$2
+    local tag=$3
+    
+    echo -e "\n${C_BLUE}⚙️ Generating DNS records for ${C_YELLOW}${transport}${C_BLUE} tunnel (${C_YELLOW}${backend}${C_BLUE})...${C_RESET}"
+    
+    if ! command -v jq &> /dev/null; then
+        echo -e "${C_YELLOW}⚠️ jq not found, installing...${C_RESET}"
+        apt install -y jq >/dev/null 2>&1 || {
+            echo -e "${C_RED}❌ Failed to install jq.${C_RESET}"
+            return 1
+        }
+    fi
+    
+    local SERVER_IPV4
+    SERVER_IPV4=$(curl -s -4 icanhazip.com)
+    if ! is_valid_ipv4 "$SERVER_IPV4"; then
+        echo -e "\n${C_RED}❌ Could not retrieve valid public IPv4 address.${C_RESET}"
+        return 1
+    fi
+    
+    local prefix=""
+    case $transport in
+        dnstt) prefix="d" ;;
+        slipstream) prefix="t" ;;
+        *) prefix="x" ;;
+    esac
+    
+    local backend_letter=""
+    case $backend in
+        ssh) backend_letter="s" ;;
+        socks) backend_letter="c" ;;
+        *) backend_letter="t" ;;
+    esac
+    
+    local clean_tag=$(echo "$tag" | tr -cd 'a-z0-9' | head -c 4)
+    [[ -z "$clean_tag" ]] && clean_tag=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)
+    
+    local RANDOM_SUBDOMAIN="${prefix}${backend_letter}${clean_tag}$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)"
+    local FULL_DOMAIN="$RANDOM_SUBDOMAIN.$DESEC_DOMAIN"
+    
+    echo -e "  ${C_DIM}Subdomain:${C_RESET} ${C_YELLOW}$RANDOM_SUBDOMAIN${C_RESET}"
+    echo -e "  ${C_DIM}Full Domain:${C_RESET} ${C_YELLOW}$FULL_DOMAIN${C_RESET}"
+    echo -e "  ${C_DIM}Server IP:${C_RESET} ${C_WHITE}$SERVER_IPV4${C_RESET}"
+    
+    # Check if THIS SPECIFIC subdomain already exists
+    local CHECK_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X GET "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/${RANDOM_SUBDOMAIN}/A/" \
+        -H "Authorization: Token $DESEC_TOKEN" 2>/dev/null)
+    
+    if [[ "$CHECK_RESPONSE" == "200" ]]; then
+        echo -e "  ${C_YELLOW}⚠️ Subdomain $RANDOM_SUBDOMAIN already exists. Using different name...${C_RESET}"
+        RANDOM_SUBDOMAIN="${prefix}${backend_letter}${clean_tag}$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 5)"
+        FULL_DOMAIN="$RANDOM_SUBDOMAIN.$DESEC_DOMAIN"
+        echo -e "  ${C_DIM}New Subdomain:${C_RESET} ${C_YELLOW}$RANDOM_SUBDOMAIN${C_RESET}"
+    fi
+    
+    # Create A record
+    local API_DATA
+    API_DATA=$(printf '[{"subname": "%s", "type": "A", "ttl": 60, "records": ["%s"]}]' "$RANDOM_SUBDOMAIN" "$SERVER_IPV4")
+
+    local CREATE_RESPONSE
+    CREATE_RESPONSE=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
+        -H "Authorization: Token $DESEC_TOKEN" -H "Content-Type: application/json" \
+        --data "$API_DATA")
+    
+    local HTTP_CODE=${CREATE_RESPONSE: -3}
+    local RESPONSE_BODY=${CREATE_RESPONSE:0:${#CREATE_RESPONSE}-3}
+
+    if [[ "$HTTP_CODE" -ne 201 && "$HTTP_CODE" -ne 200 ]]; then
+        echo -e "${C_RED}❌ Failed to create A record (HTTP $HTTP_CODE)${C_RESET}"
+        return 1
+    fi
+    
+    echo -e "  ${C_GREEN}✅ A record created: ${RANDOM_SUBDOMAIN}.${DESEC_DOMAIN} -> $SERVER_IPV4${C_RESET}"
+    
+    # Save domain info
+    local config_file="$DB_DIR/dns_info_${transport}_${backend}.conf"
+    cat > "$config_file" <<-EOF
+SUBDOMAIN="$RANDOM_SUBDOMAIN"
+FULL_DOMAIN="$FULL_DOMAIN"
+TRANSPORT="$transport"
+BACKEND="$backend"
+TAG="$tag"
+IP="$SERVER_IPV4"
+CREATED="$(date)"
+EOF
+    
+    echo -e "\n${C_GREEN}✅ Successfully created domain: ${C_YELLOW}$FULL_DOMAIN${C_RESET}"
+    echo "$FULL_DOMAIN"
+}
+
+# ========== 6. DELETE DNS RECORD (SAFE - HAZIFUTI ZINGINE) ==========
+delete_dns_record() {
+    local transport=$1
+    local backend=$2
+    
+    local config_file="$DB_DIR/dns_info_${transport}_${backend}.conf"
+    
+    if [ ! -f "$config_file" ]; then
+        echo -e "\n${C_YELLOW}ℹ️ No domain found for ${transport}/${backend}.${C_RESET}"
+        return
+    fi
+    
+    echo -e "\n${C_BLUE}🗑️ Deleting DNS records for ${transport}/${backend}...${C_RESET}"
+    source "$config_file"
+    
+    if [[ -z "$SUBDOMAIN" ]]; then
+        echo -e "${C_RED}❌ Could not read subdomain from config.${C_RESET}"
+        return
+    fi
+
+    local DELETE_RESPONSE=$(curl -s -w "%{http_code}" -X DELETE "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/${SUBDOMAIN}/A/" \
+         -H "Authorization: Token $DESEC_TOKEN")
+    
+    local HTTP_CODE=${DELETE_RESPONSE: -3}
+    
+    if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "204" ]]; then
+        echo -e "${C_GREEN}✅ Deleted domain: ${C_YELLOW}$FULL_DOMAIN${C_RESET}"
+        rm -f "$config_file"
+    else
+        echo -e "${C_RED}❌ Failed to delete domain (HTTP $HTTP_CODE)${C_RESET}"
+    fi
+}
+
+# ========== 7. DELETE ALL DNS RECORDS (FOR THIS VPS ONLY) ==========
+delete_all_dns_records() {
+    echo -e "\n${C_RED}${C_BOLD}⚠️ WARNING: This will delete ALL DNS records for this VPS!${C_RESET}"
+    echo -e "${C_YELLOW}This includes all subdomains created by Voltron Gate on this server.${C_RESET}"
+    echo -e "${C_DIM}It will NOT delete domains from other VPS or other services.${C_RESET}"
+    echo ""
+    read -p "Type 'yes' to confirm deletion of ALL Voltron Gate DNS records: " confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${C_YELLOW}Cancelled.${C_RESET}"
+        return
+    fi
+    
+    echo -e "\n${C_BLUE}🗑️ Deleting all Voltron Gate DNS records...${C_RESET}"
+    
+    local deleted=0
+    local failed=0
+    
+    for config_file in "$DB_DIR"/dns_info_*.conf; do
+        if [[ -f "$config_file" ]]; then
+            source "$config_file"
+            if [[ -n "$SUBDOMAIN" ]]; then
+                curl -s -X DELETE "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/${SUBDOMAIN}/A/" \
+                     -H "Authorization: Token $DESEC_TOKEN" > /dev/null
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${C_GREEN}✅ Deleted: $SUBDOMAIN${C_RESET}"
+                    rm -f "$config_file"
+                    ((deleted++))
+                else
+                    echo -e "  ${C_RED}❌ Failed: $SUBDOMAIN${C_RESET}"
+                    ((failed++))
+                fi
+            fi
+        fi
+    done
+    
+    echo -e "\n${C_GREEN}✅ Deleted $deleted records. Failed: $failed${C_RESET}"
+}
+
+# ========== 8. DOMAIN MENU ==========
+domain_menu() {
+    clear; show_banner
+    echo -e "${C_BOLD}${C_PURPLE}--- 🌐 DNS Domain Management ---${C_RESET}"
+    
+    echo -e "\n${C_CYAN}Select action:${C_RESET}"
+    echo "  1) Generate new domain (DNSTT)"
+    echo "  2) Generate new domain (Slipstream)"
+    echo "  3) Delete domain (DNSTT)"
+    echo "  4) Delete domain (Slipstream)"
+    echo "  5) Delete ALL domains for this VPS"
+    echo "  6) List existing domains"
+    echo ""
+    echo -e "  ${C_RED}[0]${C_RESET} Return to main menu"
+    echo ""
+    
+    read -p "👉 Select option: " choice
+    
+    case $choice in
+        1)
+            read -p "Tag (optional): " tag
+            [[ -z "$tag" ]] && tag="vpn"
+            generate_dns_record "dnstt" "socks" "$tag"
+            press_enter
+            ;;
+        2)
+            read -p "Tag (optional): " tag
+            [[ -z "$tag" ]] && tag="vpn"
+            generate_dns_record "slipstream" "socks" "$tag"
+            press_enter
+            ;;
+        3)
+            delete_dns_record "dnstt" "socks"
+            press_enter
+            ;;
+        4)
+            delete_dns_record "slipstream" "socks"
+            press_enter
+            ;;
+        5)
+            delete_all_dns_records
+            press_enter
+            ;;
+        6)
+            echo -e "\n${C_CYAN}Existing domains:${C_RESET}"
+            for config_file in "$DB_DIR"/dns_info_*.conf; do
+                if [[ -f "$config_file" ]]; then
+                    source "$config_file"
+                    echo -e "  ${C_GREEN}●${C_RESET} ${C_YELLOW}$FULL_DOMAIN${C_RESET} ${C_DIM}($TRANSPORT/$BACKEND - $TAG)${C_RESET}"
+                fi
+            done
+            press_enter
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${C_RED}❌ Invalid option${C_RESET}"
+            press_enter
+            ;;
+    esac
+}
+
+# ========== 9. AUTO-INSTALL BINARIES ==========
 install_binaries() {
     log "📥 Installing DNS tunnel binaries (pre-compiled)..."
     
-    # ---- Check architecture ----
     local arch
     arch=$(uname -m)
     local SUFFIX=""
@@ -624,23 +839,18 @@ install_binaries() {
     
     echo -e "${C_DIM}📐 Architecture detected: $arch${C_RESET}\n"
     
-    # ---- Install dependencies ----
     log "Installing dependencies..."
-    apt update && apt install -y curl wget bc iptables net-tools unzip python3
+    apt update && apt install -y curl wget bc iptables net-tools unzip python3 jq
     
-    # ---- Create user ----
     if ! id "voltrondns" &>/dev/null; then
         useradd -r -s /usr/sbin/nologin voltrondns
     fi
     
-    # ---- 1.1 GOST DNS Router v2.12.0 ----
+    # GOST
     log "Installing GOST DNS Router v2.12.0..."
     if ! command -v gost &>/dev/null; then
-        echo -e "${C_BLUE}📥 Downloading GOST v2.12.0...${C_RESET}"
-        
         if wget -q --show-progress "$GOST_URL" -O /tmp/gost.tar.gz; then
             tar -xzf /tmp/gost.tar.gz -C /tmp
-            
             if [[ -f "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" ]]; then
                 cp "/tmp/gost_2.12.0_linux_${SUFFIX}/gost" "$BIN_DIR/gost"
             elif [[ -f "/tmp/gost" ]]; then
@@ -648,27 +858,18 @@ install_binaries() {
             else
                 find /tmp -name "gost" -type f -executable | head -1 | xargs -I {} cp {} "$BIN_DIR/gost"
             fi
-            
             chmod +x "$BIN_DIR/gost"
             rm -rf /tmp/gost*
-            
-            if command -v gost &>/dev/null; then
-                local gost_version=$(gost -V 2>&1 | head -1 || echo "v2.12.0")
-                success "GOST installed: $gost_version"
-            else
-                echo -e "${C_RED}❌ Failed to install GOST binary${C_RESET}"
-                return 1
-            fi
+            success "GOST installed"
         else
             echo -e "${C_RED}❌ Failed to download GOST${C_RESET}"
             return 1
         fi
     else
-        local gost_version=$(gost -V 2>&1 | head -1 || echo "unknown")
-        success "GOST already installed: $gost_version"
+        success "GOST already installed"
     fi
     
-    # ---- 1.2 DNSTT Server (Falcon style) ----
+    # DNSTT
     log "Installing DNSTT server..."
     if ! command -v dnstt-server &>/dev/null; then
         if wget -q "$DNSTT_URL" -O "$BIN_DIR/dnstt-server"; then
@@ -682,7 +883,6 @@ install_binaries() {
         success "DNSTT server already installed"
     fi
     
-    # ---- 1.3 DNSTT Client ----
     log "Installing DNSTT client..."
     if ! command -v dnstt-client &>/dev/null; then
         if wget -q "$DNSTT_CLIENT_URL" -O "$BIN_DIR/dnstt-client"; then
@@ -695,7 +895,7 @@ install_binaries() {
         success "DNSTT client already installed"
     fi
     
-    # ---- 1.4 Slipstream Server (Falcon style) ----
+    # Slipstream
     log "Installing Slipstream server..."
     if ! command -v slipstream-server &>/dev/null; then
         if wget -q "$SLIPSTREAM_URL" -O "$BIN_DIR/slipstream-server"; then
@@ -709,16 +909,12 @@ install_binaries() {
         success "Slipstream already installed"
     fi
     
-    # ---- 1.5 Create custom SOCKS5 (instead of microsocks) ----
+    # Custom SOCKS5
     create_custom_socks5
     
-    # ---- Set ownership ----
     chown -R voltrondns:voltrondns "$DB_DIR" 2>/dev/null || true
-    
-    # ---- Create installation flag ----
     touch "$INSTALL_FLAG"
     
-    # ---- Show summary ----
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}              ✅ ALL BINARIES INSTALLED!                     ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -732,107 +928,7 @@ install_binaries() {
     press_enter
 }
 
-# ========== 6. GENERATE DESEC DOMAIN ==========
-gen_desec_domain() {
-    local transport=$1
-    local backend=$2
-    local rand=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 4)
-    
-    local ip=$(get_ip)
-    is_valid_ipv4 "$ip" || { error "Invalid IP: $ip"; return 1; }
-    
-    local prefix=""
-    case $transport in
-        dnstt) prefix="d" ;;
-        slipstream) prefix="t" ;;
-        *) prefix="x" ;;
-    esac
-    
-    local backend_suffix=""
-    case $backend in
-        ssh) backend_suffix="ssh" ;;
-        socks) backend_suffix="socks" ;;
-        *) backend_suffix="tun" ;;
-    esac
-    
-    local ns_sub="${prefix}-ns-${rand}"
-    local tun_sub="${prefix}-${backend_suffix}-${rand}"
-    
-    log "Creating DNS records for ${C_YELLOW}${transport}${C_RESET} tunnel..."
-    echo -e "  ${C_DIM}NS Subdomain:${C_RESET} ${ns_sub}.${DESEC_DOMAIN}"
-    echo -e "  ${C_DIM}Tunnel Subdomain:${C_RESET} ${tun_sub}.${DESEC_DOMAIN}"
-    echo -e "  ${C_DIM}Server IP:${C_RESET} ${ip}"
-    
-    # ---- Test deSEC API connection ----
-    local test_response=$(curl -s -o /dev/null -w "%{http_code}" -X GET "https://desec.io/api/v1/domains" \
-        -H "Authorization: Token $DESEC_TOKEN" 2>/dev/null)
-    
-    if [[ "$test_response" == "401" ]] || [[ "$test_response" == "403" ]]; then
-        error "Invalid deSEC token. Please check your credentials."
-        return 1
-    fi
-    
-    # ---- Create A record ----
-    local api_data_a=$(cat <<EOF
-[{
-    "subname": "$ns_sub",
-    "type": "A",
-    "ttl": 60,
-    "records": ["$ip"]
-}]
-EOF
-)
-    
-    local response=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
-        -H "Authorization: Token $DESEC_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "$api_data_a")
-    
-    local http_code=${response: -3}
-    if [[ $http_code -ne 201 && $http_code -ne 200 ]]; then
-        error "Failed to create A record (HTTP $http_code)"
-        return 1
-    fi
-    echo -e "  ${C_GREEN}✅ A record created: ${ns_sub}.${DESEC_DOMAIN} -> $ip${C_RESET}"
-    
-    # ---- Create NS record ----
-    local api_data_ns=$(cat <<EOF
-[{
-    "subname": "$tun_sub",
-    "type": "NS",
-    "ttl": 60,
-    "records": ["${ns_sub}.${DESEC_DOMAIN}."]
-}]
-EOF
-)
-    
-    response=$(curl -s -w "%{http_code}" -X POST "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/" \
-        -H "Authorization: Token $DESEC_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "$api_data_ns")
-    
-    http_code=${response: -3}
-    if [[ $http_code -ne 201 && $http_code -ne 200 ]]; then
-        error "Failed to create NS record (HTTP $http_code)"
-        curl -s -X DELETE "https://desec.io/api/v1/domains/$DESEC_DOMAIN/rrsets/${ns_sub}/A/" \
-            -H "Authorization: Token $DESEC_TOKEN" >/dev/null 2>&1
-        return 1
-    fi
-    echo -e "  ${C_GREEN}✅ NS record created: ${tun_sub}.${DESEC_DOMAIN} -> ${ns_sub}.${DESEC_DOMAIN}${C_RESET}"
-    
-    # ---- Return full domain ----
-    local full_domain="${tun_sub}.${DESEC_DOMAIN}"
-    echo -e "  ${C_GREEN}✅ Tunnel domain: ${C_YELLOW}${full_domain}${C_RESET}"
-    
-    # Save domain info for cleanup
-    echo "NS_SUB=$ns_sub" > "$DB_DIR/dns_info.conf"
-    echo "TUN_SUB=$tun_sub" >> "$DB_DIR/dns_info.conf"
-    echo "FULL_DOMAIN=$full_domain" >> "$DB_DIR/dns_info.conf"
-    
-    echo "$full_domain"
-}
-
-# ========== 7. START DNS ROUTER (GOST) ==========
+# ========== 10. START DNS ROUTER (GOST) ==========
 start_dns_router() {
     log "Starting DNS Router (GOST) on port $DNS_PORT..."
     
@@ -883,7 +979,7 @@ EOF
     success "DNS Router started with $count tunnels"
 }
 
-# ========== 8. ADD TUNNEL ==========
+# ========== 11. ADD TUNNEL ==========
 add_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🚀 ADD DNS TUNNEL                        ${C_RESET}"
@@ -937,27 +1033,16 @@ add_tunnel() {
     
     read -p "Tunnel Tag: " TAG
     if [[ -z "$TAG" ]]; then
-        TAG="tunnel-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
+        TAG="vpn-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)"
     else
-        TAG=$(echo "$TAG" | tr -cd 'a-zA-Z0-9-' | head -c 20)
-        [[ -z "$TAG" ]] && TAG="tunnel-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
+        TAG=$(echo "$TAG" | tr -cd 'a-zA-Z0-9-' | head -c 15)
+        [[ -z "$TAG" ]] && TAG="vpn-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)"
     fi
     echo -e "${C_GREEN}✅ Tag: ${C_YELLOW}$TAG${C_RESET}\n"
     
-    # ---- STEP 4: Generate Unique Ports ----
-    TUNNEL_PORT=$(find_unique_port $TUNNEL_PORT_START)
-    if [[ "$BACKEND" == "socks" ]]; then
-        BACKEND_PORT=$(find_unique_port $BACKEND_PORT_START)
-    else
-        BACKEND_PORT=22
-    fi
-    
-    echo -e "${C_GREEN}✅ DNS Port: ${C_YELLOW}$TUNNEL_PORT${C_RESET}"
-    echo -e "${C_GREEN}✅ Backend Port: ${C_YELLOW}$BACKEND_PORT${C_RESET}\n"
-    
-    # ---- STEP 5: Domain ----
+    # ---- STEP 4: Domain ----
     echo -e "${C_CYAN}${C_BOLD}[4] Domain:${C_RESET}"
-    echo "  1) Auto-generate with deSEC (Recommended)"
+    echo "  1) Auto-generate with deSEC (Falcon style)"
     echo "  2) Enter custom domain"
     echo ""
     
@@ -966,7 +1051,7 @@ add_tunnel() {
         read -p "Choice [1-2]: " d_choice
         case $d_choice in
             1)
-                DOMAIN=$(gen_desec_domain "$TRANSPORT" "$BACKEND")
+                DOMAIN=$(generate_dns_record "$TRANSPORT" "$BACKEND" "$TAG")
                 if [[ -z "$DOMAIN" ]]; then
                     echo -e "${C_YELLOW}⚠️ Auto-generation failed. Please try again or use custom domain.${C_RESET}"
                     continue
@@ -992,6 +1077,17 @@ add_tunnel() {
         esac
     done
     echo -e "${C_GREEN}✅ Domain: ${C_YELLOW}$DOMAIN${C_RESET}\n"
+    
+    # ---- STEP 5: Generate Unique Ports ----
+    TUNNEL_PORT=$(find_unique_port $TUNNEL_PORT_START)
+    if [[ "$BACKEND" == "socks" ]]; then
+        BACKEND_PORT=$(find_unique_port $BACKEND_PORT_START)
+    else
+        BACKEND_PORT=22
+    fi
+    
+    echo -e "${C_GREEN}✅ DNS Port: ${C_YELLOW}$TUNNEL_PORT${C_RESET}"
+    echo -e "${C_GREEN}✅ Backend Port: ${C_YELLOW}$BACKEND_PORT${C_RESET}\n"
     
     # ---- STEP 6: MTU (ONLY FOR DNSTT) ----
     local MTU=""
@@ -1096,7 +1192,6 @@ WantedBy=multi-user.target
 EOF
             ;;
         slipstream)
-            # Unique certificate per tunnel
             local cert_file="$DB_DIR/slipstream_${TAG}_cert.pem"
             local key_file="$DB_DIR/slipstream_${TAG}_key.pem"
             
@@ -1135,11 +1230,11 @@ EOF
     systemctl enable "$service_name"
     systemctl restart "$service_name"
     
-    # ---- STEP 9: Update GOST DNS Router ----
+    # Update GOST
     echo -e "\n${C_BLUE}🔄 Updating DNS Router...${C_RESET}"
     systemctl restart gost-dns 2>/dev/null || true
     
-    # ---- STEP 10: Show Summary ----
+    # Show Summary
     echo -e "\n${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}                    ✅ TUNNEL CREATED!                       ${C_RESET}"
     echo -e "${C_GREEN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -1164,7 +1259,7 @@ EOF
     press_enter
 }
 
-# ========== 9. LIST TUNNELS ==========
+# ========== 12. LIST TUNNELS ==========
 list_tunnels() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    📡 ACTIVE TUNNELS                         ${C_RESET}"
@@ -1351,7 +1446,7 @@ list_tunnels() {
     press_enter
 }
 
-# ========== 10. DELETE TUNNEL ==========
+# ========== 13. DELETE TUNNEL ==========
 delete_tunnel() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🗑️ DELETE TUNNEL                        ${C_RESET}"
@@ -1434,7 +1529,7 @@ delete_tunnel() {
     press_enter
 }
 
-# ========== 11. LIMITER SERVICE ==========
+# ========== 14. LIMITER SERVICE ==========
 setup_limiter() {
     log "Installing bandwidth monitoring + limiter service..."
     
@@ -1623,7 +1718,7 @@ EOF
     press_enter
 }
 
-# ========== 12. ADD SSH USER ==========
+# ========== 15. ADD SSH USER ==========
 add_ssh_user() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👤 ADD SSH USER                          ${C_RESET}"
@@ -1723,7 +1818,7 @@ add_ssh_user() {
     press_enter
 }
 
-# ========== 13. ADD SOCKS5 USER ==========
+# ========== 16. ADD SOCKS5 USER ==========
 add_socks5_user() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🔌 ADD SOCKS5 USER                       ${C_RESET}"
@@ -1820,7 +1915,7 @@ add_socks5_user() {
     press_enter
 }
 
-# ========== 14. GENERATE SSH CLIENT CONFIG ==========
+# ========== 17. GENERATE SSH CLIENT CONFIG ==========
 generate_ssh_client_config() {
     local user=$1
     local pass=$2
@@ -1908,7 +2003,7 @@ EOF
     press_enter
 }
 
-# ========== 15. GENERATE SOCKS5 CLIENT CONFIG ==========
+# ========== 18. GENERATE SOCKS5 CLIENT CONFIG ==========
 generate_socks5_client_config() {
     local user=$1
     local pass=$2
@@ -2011,7 +2106,7 @@ EOF
     press_enter
 }
 
-# ========== 16. SSH USER MANAGER ==========
+# ========== 19. SSH USER MANAGER ==========
 ssh_user_menu() {
     while true; do
         clear
@@ -2058,7 +2153,7 @@ ssh_user_menu() {
     done
 }
 
-# ========== 17. SOCKS5 USER MANAGER ==========
+# ========== 20. SOCKS5 USER MANAGER ==========
 socks5_user_menu() {
     while true; do
         clear
@@ -2112,7 +2207,64 @@ socks5_user_menu() {
     done
 }
 
-# ========== 18. SSH USER FUNCTIONS ==========
+# ========== 21. GENERATE CLIENT CONFIG MENUS ==========
+generate_ssh_client_config_menu() {
+    echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}                    📱 GENERATE SSH CLIENT CONFIG            ${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}\n"
+    
+    if [[ ! -f "$SSH_USERS_DB" || ! -s "$SSH_USERS_DB" ]]; then
+        echo -e "${C_YELLOW}ℹ️ No SSH users found.${C_RESET}"
+        press_enter
+        return
+    fi
+    
+    echo -e "${C_CYAN}Available SSH users:${C_RESET}"
+    cut -d: -f1 "$SSH_USERS_DB" | cat -n
+    echo ""
+    
+    local username
+    while true; do
+        read -p "Enter username: " username
+        if grep -q "^$username:" "$SSH_USERS_DB" 2>/dev/null; then
+            break
+        fi
+        echo -e "${C_RED}❌ User not found.${C_RESET}"
+    done
+    
+    local pass=$(grep "^$username:" "$SSH_USERS_DB" | cut -d: -f2)
+    generate_ssh_client_config "$username" "$pass"
+}
+
+generate_socks5_client_config_menu() {
+    echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}                    📱 GENERATE SOCKS5 CLIENT CONFIG          ${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}\n"
+    
+    if [[ ! -f "$SOCKS5_USERS_DB" || ! -s "$SOCKS5_USERS_DB" ]]; then
+        echo -e "${C_YELLOW}ℹ️ No SOCKS5 users found.${C_RESET}"
+        press_enter
+        return
+    fi
+    
+    echo -e "${C_CYAN}Available SOCKS5 users:${C_RESET}"
+    cut -d: -f1 "$SOCKS5_USERS_DB" | cat -n
+    echo ""
+    
+    local username
+    while true; do
+        read -p "Enter username: " username
+        if grep -q "^$username:" "$SOCKS5_USERS_DB" 2>/dev/null; then
+            break
+        fi
+        echo -e "${C_RED}❌ User not found.${C_RESET}"
+    done
+    
+    local pass=$(grep "^$username:" "$SOCKS5_USERS_DB" | cut -d: -f2)
+    generate_socks5_client_config "$username" "$pass"
+}
+
+# ========== 22. SSH USER FUNCTIONS ==========
 list_ssh_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👥 SSH USERS                             ${C_RESET}"
@@ -2380,7 +2532,7 @@ unlock_ssh_user() {
     press_enter
 }
 
-# ========== 19. SOCKS5 USER FUNCTIONS ==========
+# ========== 23. SOCKS5 USER FUNCTIONS ==========
 list_socks5_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    🔌 SOCKS5 USERS                          ${C_RESET}"
@@ -2573,7 +2725,7 @@ delete_socks5_user() {
     press_enter
 }
 
-# ========== 20. LIST ALL USERS ==========
+# ========== 24. LIST ALL USERS ==========
 list_users() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    👥 ALL USERS                            ${C_RESET}"
@@ -2645,7 +2797,7 @@ list_users() {
     press_enter
 }
 
-# ========== 21. SUPER SPEED BOOSTER ==========
+# ========== 25. SUPER SPEED BOOSTER ==========
 apply_speed_booster() {
     clear
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -2678,10 +2830,8 @@ apply_speed_booster() {
     echo -e "\n${C_BLUE}⚡ Applying Super Speed Booster level $level...${C_RESET}"
     echo -e "${C_DIM}Optimizing DNSTT for maximum performance...${C_RESET}\n"
     
-    # ---- Apply settings based on level ----
     case $level in
         1)
-            echo -e "${C_CYAN}▶ LIGHTNING MODE - Light speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
@@ -2702,7 +2852,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ BBR congestion control activated${C_RESET}"
             ;;
         2)
-            echo -e "${C_CYAN}▶ STORM MODE - Storm speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=2097152 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=2097152 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=33554432 >/dev/null 2>&1
@@ -2724,7 +2873,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ BBR + FQ activated${C_RESET}"
             ;;
         3)
-            echo -e "${C_CYAN}▶ TURBO MODE - Turbo speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=4194304 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=4194304 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=67108864 >/dev/null 2>&1
@@ -2748,7 +2896,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ Full TCP optimizations activated${C_RESET}"
             ;;
         4)
-            echo -e "${C_CYAN}▶ ULTRA MODE - Ultra speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=8388608 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=8388608 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1
@@ -2773,7 +2920,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ Advanced TCP optimizations activated${C_RESET}"
             ;;
         5)
-            echo -e "${C_CYAN}▶ EXTREME MODE - Extreme speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=16777216 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=16777216 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=268435456 >/dev/null 2>&1
@@ -2799,7 +2945,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ Extreme TCP optimizations activated${C_RESET}"
             ;;
         6)
-            echo -e "${C_CYAN}▶ MEGA MODE - Mega speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=33554432 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=33554432 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=536870912 >/dev/null 2>&1
@@ -2826,7 +2971,6 @@ apply_speed_booster() {
             echo -e "${C_GREEN}✅ Enterprise-grade optimizations activated${C_RESET}"
             ;;
         7)
-            echo -e "${C_CYAN}▶ TITAN MODE - Titan speed activation${C_RESET}"
             sysctl -w net.core.rmem_default=67108864 >/dev/null 2>&1
             sysctl -w net.core.wmem_default=67108864 >/dev/null 2>&1
             sysctl -w net.core.rmem_max=1073741824 >/dev/null 2>&1
@@ -2935,7 +3079,7 @@ EOF
     press_enter
 }
 
-# ========== 22. SETUP FIREWALL ==========
+# ========== 26. SETUP FIREWALL ==========
 setup_firewall() {
     log "Setting up firewall..."
     
@@ -2959,7 +3103,7 @@ setup_firewall() {
     press_enter
 }
 
-# ========== 23. SHOW SYSTEM INFO ==========
+# ========== 27. SHOW SYSTEM INFO ==========
 show_system_info() {
     echo -e "\n${C_CYAN}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
     echo -e "${C_CYAN}${C_BOLD}                    📊 SYSTEM INFORMATION                    ${C_RESET}"
@@ -2978,7 +3122,7 @@ show_system_info() {
     press_enter
 }
 
-# ========== 24. UNINSTALL SCRIPT ==========
+# ========== 28. UNINSTALL SCRIPT ==========
 uninstall_script() {
     clear
     echo -e "${C_RED}${C_BOLD}═══════════════════════════════════════════════════════════════${C_RESET}"
@@ -3078,7 +3222,7 @@ uninstall_script() {
     exit 0
 }
 
-# ========== 25. MAIN MENU ==========
+# ========== 29. MAIN MENU ==========
 main_menu() {
     while true; do
         clear
@@ -3116,9 +3260,14 @@ main_menu() {
         echo -e "  ${C_GREEN}[C]${C_RESET} Install Limiter Service"
         echo ""
         
+        echo -e "  ${C_GREEN}${C_BOLD}🌐 DOMAIN MANAGEMENT${C_RESET}"
+        echo -e "  ──────────────────────"
+        echo -e "  ${C_GREEN}[D]${C_RESET} Domain Manager"
+        echo ""
+        
         echo -e "  ${C_GREEN}${C_BOLD}ℹ️ INFO${C_RESET}"
         echo -e "  ────────────"
-        echo -e "  ${C_GREEN}[D]${C_RESET} System Info"
+        echo -e "  ${C_GREEN}[E]${C_RESET} System Info"
         echo ""
         
         echo -e "  ${C_RED}${C_BOLD}[0]${C_RESET} Exit"
@@ -3140,7 +3289,7 @@ main_menu() {
         while true; do
             read -p "👉 Select option: " opt
             case $opt in
-                1|2|3|4|5|6|7|8|9|A|a|B|b|C|c|D|d|0|99)
+                1|2|3|4|5|6|7|8|9|A|a|B|b|C|c|D|d|E|e|0|99)
                     break
                     ;;
                 *)
@@ -3164,7 +3313,8 @@ main_menu() {
             A) apply_speed_booster ;;
             B) setup_firewall ;;
             C) setup_limiter ;;
-            D) show_system_info ;;
+            D) domain_menu ;;
+            E) show_system_info ;;
             0) 
                 echo -e "${C_GREEN}👋 Goodbye!${C_RESET}"
                 exit 0 
